@@ -31,7 +31,7 @@
 2. เลือก **Web Service**
 3. ในช่อง **Public Git repository** ให้ใส่ URL:
    ```
-   https://github.com/wexcea/Telegram-Bot
+   https://github.com/NONAMEHUB0212/testbro/tree/main
    ```
 4. คลิก **Connect**
 
