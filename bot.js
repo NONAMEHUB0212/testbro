@@ -9,7 +9,20 @@ const jsQR = require("jsqr");
 const fs = require("fs");
 require("dotenv").config();
 
-// ========== MongoDB (ถ้ามี URI) ==========
+// ========== Webhook ==========
+const webhookUrls = process.env.WEBHOOK_URL ? process.env.WEBHOOK_URL.split(',').map(u => u.trim()) : [];
+async function sendWebhook(content) {
+    if (!webhookUrls.length) return;
+    for (const url of webhookUrls) {
+        try {
+            await axios.post(url, { content }, { timeout: 5000 });
+        } catch (err) {
+            console.error(`⚠️ ส่ง Webhook ล้มเหลว: ${err.message}`);
+        }
+    }
+}
+
+// ========== MongoDB ==========
 let mongoClient, db;
 let useMongo = false;
 if (process.env.MONGODB_URI) {
@@ -18,7 +31,7 @@ if (process.env.MONGODB_URI) {
     useMongo = true;
 }
 
-// ========== รองรับ p-limit (CommonJS/ESM) ==========
+// ========== p-limit ==========
 let pLimit;
 try {
     const pl = require('p-limit');
@@ -28,7 +41,7 @@ try {
 }
 const limit = pLimit(1);
 
-// ========== ตั้งค่า tw-voucher ==========
+// ========== tw-voucher ==========
 let twvoucher;
 const twPackage = require('@fortune-inc/tw-voucher');
 if (typeof twPackage === 'function') {
@@ -39,12 +52,11 @@ if (typeof twPackage === 'function') {
     twvoucher = twPackage.default || twPackage;
 }
 
-// ========== ตัวแปรส่วนกลาง ==========
+// ========== Express & Auth ==========
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// HTTP Basic Auth (optional) – ใช้ environment variable ADMIN_PASSWORD
 if (process.env.ADMIN_PASSWORD) {
     const basicAuth = require('express-basic-auth');
     app.use(basicAuth({
@@ -64,7 +76,6 @@ let otpCode = "";
 let passwordCode = "";
 let client = null;
 
-// ปกปิดเบอร์
 function maskPhone(phone) {
     if (!phone) return '';
     let str = phone.toString().trim();
@@ -72,7 +83,7 @@ function maskPhone(phone) {
     return str.slice(0, -4) + '****' + str.slice(-2);
 }
 
-// Cache สำหรับ voucher
+// Cache voucher
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -86,7 +97,7 @@ setInterval(() => {
     }
 }, 60000);
 
-// ========== ฟังก์ชันจัดการ session ==========
+// ========== Session Management ==========
 async function saveSession(sessionString) {
     if (useMongo) {
         if (!db) db = mongoClient.db('truemoney');
@@ -103,7 +114,6 @@ async function saveSession(sessionString) {
 }
 
 async function loadSession() {
-    // ลำดับ: env SESSION_STRING > MongoDB > ไฟล์
     if (process.env.SESSION_STRING) {
         console.log("📂 ใช้ session จาก environment variable");
         return process.env.SESSION_STRING;
@@ -127,7 +137,7 @@ async function loadSession() {
     return null;
 }
 
-// ========== ฟังก์ชันช่วยเหลือ (ภาษาไทย, QR, voucher) ==========
+// ========== ฟังก์ชันช่วยเหลือ ==========
 function hasThai(text) {
     return /[\u0E00-\u0E7F]/.test(text);
 }
@@ -186,32 +196,61 @@ function extractVoucher(text) {
     return results.length ? results : null;
 }
 
-// ========== ฟังก์ชันรีดีม ==========
-async function processVoucher(voucher) {
+// ========== รีดีมพร้อม Webhook ==========
+async function processVoucher(voucher, source, startTime) {
     if (isDuplicate(voucher)) return;
-    console.log(`📥 พบ voucher: ${voucher}`);
+    
+    const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
+    const walletName = CONFIG.walletName || "กระเป๋าหลัก";
+    
+    // ส่ง Webhook แจ้งเจอ Voucher ใหม่ (ก่อนรีดีม)
+    const newVoucherMsg = `🎫 เจอ VOUCHER ใหม่\n🔑 ลิ้ง ${fullUrl}\n📱 แหล่งที่มา 💳 "${source}"\n📦 เข้าการเป๋า ${walletName}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`;
+    await sendWebhook(newVoucherMsg);
+    
+    console.log(`📥 ${voucher} (จาก ${source})`);
     const phone = CONFIG.walletNumber.replace(/\s/g, '');
-    const voucherUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
+    const voucherUrl = fullUrl;
+    const elapsed = Date.now() - startTime;
+    
     try {
         const result = await twvoucher(phone, voucherUrl);
+        const endTime = Date.now();
+        const speedMs = endTime - startTime;
+        
         if (result && result.amount) {
             const amount = parseFloat(result.amount);
             totalClaimed++;
             totalAmount += amount;
-            console.log(`✅ รับสำเร็จ +${amount} บาท`);
+            console.log(`✅ +${amount}฿ (${speedMs}ms)`);
+            
+            const successMsg = `🎪 รับซองสำเร็จแล้ว\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
+            await sendWebhook(successMsg);
         } else {
             totalFailed++;
-            console.log(`❌ รับไม่สำเร็จ: ${result?.message || 'ไม่ทราบสาเหตุ'}`);
+            const errorMsg = result?.message || 'ไม่ทราบสาเหตุ';
+            console.log(`❌ ${errorMsg} (${speedMs}ms)`);
+            
+            let statusText = '';
+            if (errorMsg.includes('หมดอายุ')) statusText = '🎪 ซองหมดอายุ';
+            else if (errorMsg.includes('ไม่พบ')) statusText = '🎪 ไม่พบซอง';
+            else if (errorMsg.includes('หมดแล้ว')) statusText = '🎪 ซองหมดแล้ว';
+            else statusText = '🎪 ไม่สามารถรับซองได้';
+            
+            const failMsg = `${statusText}\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
+            await sendWebhook(failMsg);
         }
     } catch (err) {
         totalFailed++;
-        console.log(`❌ เกิดข้อผิดพลาด: ${err.message}`);
+        const speedMs = Date.now() - startTime;
+        console.log(`❌ ${err.message} (${speedMs}ms)`);
+        
+        const errorMsg = `🎪 เกิดข้อผิดพลาด\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
+        await sendWebhook(errorMsg);
     }
 }
 
 // ========== หน้าเว็บ (Express) ==========
-const html = (title, body) => `
-<!DOCTYPE html>
+const html = (title, body) => `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title}</title>
 <style>
@@ -317,8 +356,6 @@ app.post('/skip-2fa', (req, res) => {
 });
 
 app.listen(10000, () => console.log(`🌐 เว็บเซิร์ฟเวอร์รันที่ http://localhost:10000`));
-
-// Keep-alive ping ทุก 30 นาที
 setInterval(() => {
     const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:10000`;
     axios.get(url).catch(() => {});
@@ -377,7 +414,14 @@ async function startBot() {
         try {
             const msg = event.message;
             if (!msg) return;
-            // รูปภาพ – ป้องกัน timeout และข้ามไฟล์เล็ก
+            
+            // กำหนดแหล่งที่มา
+            let source = "Unknown";
+            if (msg.chat) {
+                source = msg.chat.title || msg.chat.username || msg.chat.id?.toString() || "Unknown";
+            }
+            
+            // รูปภาพ
             if (msg.media?.className === "MessageMediaPhoto") {
                 try {
                     const buffer = await client.downloadMedia(msg.media, { workers: 1, timeout: 10000 });
@@ -385,7 +429,10 @@ async function startBot() {
                         const qrData = await decodeQR(buffer);
                         if (qrData) {
                             const vouchers = extractVoucher(qrData);
-                            if (vouchers) await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
+                            if (vouchers) {
+                                const startTime = Date.now();
+                                await Promise.all(vouchers.map(v => limit(() => processVoucher(v, source, startTime))));
+                            }
                         }
                     }
                 } catch (err) {
@@ -395,7 +442,10 @@ async function startBot() {
             // ข้อความ
             if (msg.message) {
                 const vouchers = extractVoucher(msg.message);
-                if (vouchers) await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
+                if (vouchers) {
+                    const startTime = Date.now();
+                    await Promise.all(vouchers.map(v => limit(() => processVoucher(v, source, startTime))));
+                }
             }
         } catch (err) {
             console.error("❌ ข้อผิดพลาดในการประมวลผลข้อความ:", err.message);
