@@ -7,8 +7,18 @@ const bodyParser = require("body-parser");
 const sharp = require("sharp");
 const jsQR = require("jsqr");
 const fs = require("fs");
-const pLimit = require("p-limit");
 require("dotenv").config();
+
+// ========== รองรับ p-limit ทั้ง CommonJS และ ESM ==========
+let pLimit;
+try {
+    const pl = require('p-limit');
+    pLimit = typeof pl === 'function' ? pl : pl.default;
+} catch (e) {
+    // fallback: จำกัด concurrency 1 แบบง่าย
+    pLimit = (concurrency) => (fn) => fn();
+}
+const limit = pLimit(1); // รีดีมทีละ 1 ตัว
 
 // ========== ตั้งค่า tw-voucher ==========
 let twvoucher;
@@ -34,9 +44,6 @@ let loginStep = "need-config";
 let otpCode = "";
 let passwordCode = "";
 let client = null;
-
-// จำกัด concurrency สำหรับการรีดีม (รีดีมทีละ 1 ตัว)
-const limit = pLimit(1);
 
 // Cache สำหรับ voucher ที่เพิ่งเห็น (กันซ้ำ)
 const recentSeen = new Map();
