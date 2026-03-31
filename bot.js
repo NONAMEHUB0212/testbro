@@ -9,7 +9,16 @@ const jsQR = require("jsqr");
 const fs = require("fs");
 require("dotenv").config();
 
-// ========== รองรับ p-limit ทั้ง CommonJS และ ESM ==========
+// ========== MongoDB (ถ้ามี URI) ==========
+let mongoClient, db;
+let useMongo = false;
+if (process.env.MONGODB_URI) {
+    const { MongoClient } = require('mongodb');
+    mongoClient = new MongoClient(process.env.MONGODB_URI);
+    useMongo = true;
+}
+
+// ========== รองรับ p-limit (CommonJS/ESM) ==========
 let pLimit;
 try {
     const pl = require('p-limit');
@@ -35,7 +44,7 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// ========== HTTP Basic Auth (optional) ==========
+// HTTP Basic Auth (optional) – ใช้ environment variable ADMIN_PASSWORD
 if (process.env.ADMIN_PASSWORD) {
     const basicAuth = require('express-basic-auth');
     app.use(basicAuth({
@@ -55,7 +64,7 @@ let otpCode = "";
 let passwordCode = "";
 let client = null;
 
-// ========== ฟังก์ชันปกปิดเบอร์ ==========
+// ปกปิดเบอร์
 function maskPhone(phone) {
     if (!phone) return '';
     let str = phone.toString().trim();
@@ -63,7 +72,7 @@ function maskPhone(phone) {
     return str.slice(0, -4) + '****' + str.slice(-2);
 }
 
-// Cache สำหรับ voucher ที่เพิ่งเห็น (กันซ้ำ)
+// Cache สำหรับ voucher
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -77,17 +86,68 @@ setInterval(() => {
     }
 }, 60000);
 
-// ========== ฟังก์ชันช่วยเหลือ ==========
+// ========== ฟังก์ชันจัดการ session ==========
+async function saveSession(sessionString) {
+    if (useMongo) {
+        if (!db) db = mongoClient.db('truemoney');
+        await db.collection('sessions').updateOne(
+            { _id: 'telegram_session' },
+            { $set: { session: sessionString, updatedAt: new Date() } },
+            { upsert: true }
+        );
+        console.log("💾 บันทึก session ลง MongoDB เรียบร้อย");
+    } else {
+        fs.writeFileSync('session.txt', sessionString, 'utf8');
+        console.log("💾 บันทึก session ลงไฟล์ session.txt");
+    }
+}
+
+async function loadSession() {
+    // ลำดับ: env SESSION_STRING > MongoDB > ไฟล์
+    if (process.env.SESSION_STRING) {
+        console.log("📂 ใช้ session จาก environment variable");
+        return process.env.SESSION_STRING;
+    }
+    if (useMongo) {
+        try {
+            if (!db) db = mongoClient.db('truemoney');
+            const doc = await db.collection('sessions').findOne({ _id: 'telegram_session' });
+            if (doc && doc.session) {
+                console.log("📂 โหลด session จาก MongoDB สำเร็จ");
+                return doc.session;
+            }
+        } catch (err) {
+            console.error("⚠️ โหลด session จาก MongoDB ล้มเหลว:", err.message);
+        }
+    }
+    if (fs.existsSync('session.txt')) {
+        console.log("📂 โหลด session จากไฟล์ session.txt");
+        return fs.readFileSync('session.txt', 'utf8').trim();
+    }
+    return null;
+}
+
+// ========== ฟังก์ชันช่วยเหลือ (ภาษาไทย, QR, voucher) ==========
 function hasThai(text) {
     return /[\u0E00-\u0E7F]/.test(text);
 }
 
-const thaiMap = {"เก้าสิบเก้า":"99","เก้าสิบแปด":"98","เก้าสิบเจ็ด":"97","เก้าสิบหก":"96","เก้าสิบห้า":"95","เก้าสิบสี่":"94","เก้าสิบสาม":"93","เก้าสิบสอง":"92","เก้าสิบเอ็ด":"91","เก้าสิบ":"90","แปดสิบเก้า":"89","แปดสิบแปด":"88","แปดสิบเจ็ด":"87","แปดสิบหก":"86","แปดสิบห้า":"85","แปดสิบสี่":"84","แปดสิบสาม":"83","แปดสิบสอง":"82","แปดสิบเอ็ด":"81","แปดสิบ":"80","เจ็ดสิบเก้า":"79","เจ็ดสิบแปด":"78","เจ็ดสิบเจ็ด":"77","เจ็ดสิบหก":"76","เจ็ดสิบห้า":"75","เจ็ดสิบสี่":"74","เจ็ดสิบสาม":"73","เจ็ดสิบสอง":"72","เจ็ดสิบเอ็ด":"71","เจ็ดสิบ":"70","หกสิบเก้า":"69","หกสิบแปด":"68","หกสิบเจ็ด":"67","หกสิบหก":"66","หกสิบห้า":"65","หกสิบสี่":"64","หกสิบสาม":"63","หกสิบสอง":"62","หกสิบเอ็ด":"61","หกสิบ":"60","ห้าสิบเก้า":"59","ห้าสิบแปด":"58","ห้าสิบเจ็ด":"57","ห้าสิบหก":"56","ห้าสิบห้า":"55","ห้าสิบสี่":"54","ห้าสิบสาม":"53","ห้าสิบสอง":"52","ห้าสิบเอ็ด":"51","ห้าสิบ":"50","สี่สิบเก้า":"49","สี่สิบแปด":"48","สี่สิบเจ็ด":"47","สี่สิบหก":"46","สี่สิบห้า":"45","สี่สิบสี่":"44","สี่สิบสาม":"43","สี่สิบสอง":"42","สี่สิบเอ็ด":"41","สี่สิบ":"40","สามสิบเก้า":"39","สามสิบแปด":"38","สามสิบเจ็ด":"37","สามสิบหก":"36","สามสิบห้า":"35","สามสิบสี่":"34","สามสิบสาม":"33","สามสิบสอง":"32","สามสิบเอ็ด":"31","สามสิบ":"30","ยี่สิบเก้า":"29","ยี่สิบแปด":"28","ยี่สิบเจ็ด":"27","ยี่สิบหก":"26","ยี่สิบห้า":"25","ยี่สิบสี่":"24","ยี่สิบสาม":"23","ยี่สิบสอง":"22","ยี่สิบเอ็ด":"21","ยี่สิบ":"20","สิบเก้า":"19","สิบแปด":"18","สิบเจ็ด":"17","สิบหก":"16","สิบห้า":"15","สิบสี่":"14","สิบสาม":"13","สิบสอง":"12","สิบเอ็ด":"11","สิบ":"10","ศูนย์":"0","หนึ่ง":"1","สอง":"2","สาม":"3","สี่":"4","ห้า":"5","หก":"6","เจ็ด":"7","แปด":"8","เก้า":"9","เอ็ด":"1","ยี่":"2"};
+const thaiMap = {
+    "เก้าสิบเก้า":"99","เก้าสิบแปด":"98","เก้าสิบเจ็ด":"97","เก้าสิบหก":"96","เก้าสิบห้า":"95","เก้าสิบสี่":"94","เก้าสิบสาม":"93","เก้าสิบสอง":"92","เก้าสิบเอ็ด":"91","เก้าสิบ":"90",
+    "แปดสิบเก้า":"89","แปดสิบแปด":"88","แปดสิบเจ็ด":"87","แปดสิบหก":"86","แปดสิบห้า":"85","แปดสิบสี่":"84","แปดสิบสาม":"83","แปดสิบสอง":"82","แปดสิบเอ็ด":"81","แปดสิบ":"80",
+    "เจ็ดสิบเก้า":"79","เจ็ดสิบแปด":"78","เจ็ดสิบเจ็ด":"77","เจ็ดสิบหก":"76","เจ็ดสิบห้า":"75","เจ็ดสิบสี่":"74","เจ็ดสิบสาม":"73","เจ็ดสิบสอง":"72","เจ็ดสิบเอ็ด":"71","เจ็ดสิบ":"70",
+    "หกสิบเก้า":"69","หกสิบแปด":"68","หกสิบเจ็ด":"67","หกสิบหก":"66","หกสิบห้า":"65","หกสิบสี่":"64","หกสิบสาม":"63","หกสิบสอง":"62","หกสิบเอ็ด":"61","หกสิบ":"60",
+    "ห้าสิบเก้า":"59","ห้าสิบแปด":"58","ห้าสิบเจ็ด":"57","ห้าสิบหก":"56","ห้าสิบห้า":"55","ห้าสิบสี่":"54","ห้าสิบสาม":"53","ห้าสิบสอง":"52","ห้าสิบเอ็ด":"51","ห้าสิบ":"50",
+    "สี่สิบเก้า":"49","สี่สิบแปด":"48","สี่สิบเจ็ด":"47","สี่สิบหก":"46","สี่สิบห้า":"45","สี่สิบสี่":"44","สี่สิบสาม":"43","สี่สิบสอง":"42","สี่สิบเอ็ด":"41","สี่สิบ":"40",
+    "สามสิบเก้า":"39","สามสิบแปด":"38","สามสิบเจ็ด":"37","สามสิบหก":"36","สามสิบห้า":"35","สามสิบสี่":"34","สามสิบสาม":"33","สามสิบสอง":"32","สามสิบเอ็ด":"31","สามสิบ":"30",
+    "ยี่สิบเก้า":"29","ยี่สิบแปด":"28","ยี่สิบเจ็ด":"27","ยี่สิบหก":"26","ยี่สิบห้า":"25","ยี่สิบสี่":"24","ยี่สิบสาม":"23","ยี่สิบสอง":"22","ยี่สิบเอ็ด":"21","ยี่สิบ":"20",
+    "สิบเก้า":"19","สิบแปด":"18","สิบเจ็ด":"17","สิบหก":"16","สิบห้า":"15","สิบสี่":"14","สิบสาม":"13","สิบสอง":"12","สิบเอ็ด":"11","สิบ":"10",
+    "ศูนย์":"0","หนึ่ง":"1","สอง":"2","สาม":"3","สี่":"4","ห้า":"5","หก":"6","เจ็ด":"7","แปด":"8","เก้า":"9","เอ็ด":"1","ยี่":"2"
+};
 const thaiKeys = Object.keys(thaiMap).sort((a,b)=>b.length-a.length);
 
 function decodeThai(text) {
-    if (!text) return text;
-    if (!hasThai(text)) return text;
+    if (!text || !hasThai(text)) return text;
     let decoded = text;
     for (const key of thaiKeys) {
         decoded = decoded.replace(new RegExp(key, 'gi'), thaiMap[key]);
@@ -96,8 +156,7 @@ function decodeThai(text) {
 }
 
 function isLikelyVoucher(s) {
-    if (!s || s.length < 20 || s.length > 64) return false;
-    return /^[a-zA-Z0-9]+$/.test(s);
+    return s && s.length >= 20 && s.length <= 64 && /^[a-zA-Z0-9]+$/.test(s);
 }
 
 async function decodeQR(buffer) {
@@ -203,7 +262,7 @@ app.get('/', (req, res) => {
         res.send(html("Dashboard", `
             <h1>🚀 TrueMoney Bot</h1>
             <div class="success">✅ บอทกำลังทำงาน</div>
-            <div class="stat"><div>รับสำเร็จ<span style="color:#10b981">${totalClaimed}</span></div><div>ล้มเหลว<span style="color:#ef4444">${totalFailed}</span></div><div>ยอดรวม<span style="color:#f59e0b">${totalAmount}฿</span></div></div>
+            <div class="stat"><div>รับสำเร็จ<span>${totalClaimed}</span></div><div>ล้มเหลว<span>${totalFailed}</span></div><div>ยอดรวม<span>${totalAmount}฿</span></div></div>
             <div class="info">📱 เบอร์: ${maskPhone(CONFIG.phoneNumber)}</div>
             <div class="info">💰 กระเป๋า: ${CONFIG.walletName} (${maskPhone(CONFIG.walletNumber)})</div>
             <button onclick="if(confirm('ต้องการตั้งค่าใหม่?')){location.href='/reset'}" style="background:#ef4444;margin-top:20px">🔄 ตั้งค่าใหม่</button>
@@ -268,16 +327,13 @@ setInterval(() => {
 // ========== ฟังก์ชันหลัก ==========
 async function startBot() {
     if (!CONFIG) return;
-    const SESSION_FILE = "session.txt";
-    let sessionString = "";
-    if (fs.existsSync(SESSION_FILE)) {
-        sessionString = fs.readFileSync(SESSION_FILE, "utf8").trim();
-    }
-    const session = new StringSession(sessionString);
+    let sessionString = await loadSession();
+    const session = new StringSession(sessionString || '');
     client = new TelegramClient(session, CONFIG.apiId, CONFIG.apiHash, {
-        connectionRetries: 5,
+        connectionRetries: 10,
         useWSS: true,
-        autoReconnect: true
+        autoReconnect: true,
+        retryDelay: 5000
     });
     console.log("🚀 กำลังเริ่มบอท...\n");
     try {
@@ -308,7 +364,7 @@ async function startBot() {
                 onError: e => console.error(e.message),
             });
             const newSession = client.session.save();
-            fs.writeFileSync(SESSION_FILE, newSession, "utf8");
+            await saveSession(newSession);
             loginStep = "logged-in";
             console.log("\n✅ เข้าสู่ระบบสำเร็จ!\n");
         }
@@ -321,23 +377,25 @@ async function startBot() {
         try {
             const msg = event.message;
             if (!msg) return;
+            // รูปภาพ – ป้องกัน timeout และข้ามไฟล์เล็ก
             if (msg.media?.className === "MessageMediaPhoto") {
-                const buffer = await client.downloadMedia(msg.media, { workers: 1 });
-                if (buffer) {
-                    const qrData = await decodeQR(buffer);
-                    if (qrData) {
-                        const vouchers = extractVoucher(qrData);
-                        if (vouchers) {
-                            await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
+                try {
+                    const buffer = await client.downloadMedia(msg.media, { workers: 1, timeout: 10000 });
+                    if (buffer && buffer.length > 2000) {
+                        const qrData = await decodeQR(buffer);
+                        if (qrData) {
+                            const vouchers = extractVoucher(qrData);
+                            if (vouchers) await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
                         }
                     }
+                } catch (err) {
+                    console.error("⚠️ ดาวน์โหลดรูปไม่สำเร็จ (ข้าม):", err.message);
                 }
             }
+            // ข้อความ
             if (msg.message) {
                 const vouchers = extractVoucher(msg.message);
-                if (vouchers) {
-                    await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
-                }
+                if (vouchers) await Promise.all(vouchers.map(v => limit(() => processVoucher(v))));
             }
         } catch (err) {
             console.error("❌ ข้อผิดพลาดในการประมวลผลข้อความ:", err.message);
@@ -346,16 +404,29 @@ async function startBot() {
     console.log("✅ บอทพร้อมทำงานแล้ว!\n");
 }
 
-if (fs.existsSync('.env')) {
-    require('dotenv').config();
-    if (process.env.API_ID && process.env.API_HASH) {
-        CONFIG = {
-            apiId: parseInt(process.env.API_ID),
-            apiHash: process.env.API_HASH,
-            phoneNumber: process.env.PHONE_NUMBER,
-            walletNumber: process.env.WALLET_NUMBER,
-            walletName: process.env.WALLET_NAME || "กระเป๋าหลัก"
-        };
-        startBot();
+// เริ่มต้น MongoDB (ถ้ามี) และโหลด config
+(async () => {
+    if (useMongo) {
+        try {
+            await mongoClient.connect();
+            db = mongoClient.db('truemoney');
+            console.log("✅ เชื่อมต่อ MongoDB สำเร็จ");
+        } catch (err) {
+            console.error("❌ เชื่อมต่อ MongoDB ล้มเหลว:", err.message);
+            useMongo = false;
+        }
     }
-}
+    if (fs.existsSync('.env')) {
+        require('dotenv').config();
+        if (process.env.API_ID && process.env.API_HASH) {
+            CONFIG = {
+                apiId: parseInt(process.env.API_ID),
+                apiHash: process.env.API_HASH,
+                phoneNumber: process.env.PHONE_NUMBER,
+                walletNumber: process.env.WALLET_NUMBER,
+                walletName: process.env.WALLET_NAME || "กระเป๋าหลัก"
+            };
+            startBot();
+        }
+    }
+})();
