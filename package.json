@@ -1,0 +1,27 @@
+{
+  "name": "truemoney-auto-claim",
+  "version": "1.0.0",
+  "description": "Auto claim TrueMoney with tw-voucher (No Proxy)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["telegram", "truemoney"],
+  "author": "AutoClaim",
+  "license": "MIT",
+  "dependencies": {
+    "telegram": "^2.22.2",
+    "axios": "^1.6.2",
+    "express": "^4.18.2",
+    "jsqr": "^1.4.0",
+    "dotenv": "^16.3.1",
+    "body-parser": "^1.20.2",
+    "@fortune-inc/tw-voucher": "^1.0.0",
+    "sharp": "^0.33.4",
+    "p-limit": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
