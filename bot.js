@@ -15,10 +15,9 @@ try {
     const pl = require('p-limit');
     pLimit = typeof pl === 'function' ? pl : pl.default;
 } catch (e) {
-    // fallback: จำกัด concurrency 1 แบบง่าย
     pLimit = (concurrency) => (fn) => fn();
 }
-const limit = pLimit(1); // รีดีมทีละ 1 ตัว
+const limit = pLimit(1);
 
 // ========== ตั้งค่า tw-voucher ==========
 let twvoucher;
@@ -36,6 +35,17 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
+// ========== HTTP Basic Auth (optional) ==========
+if (process.env.ADMIN_PASSWORD) {
+    const basicAuth = require('express-basic-auth');
+    app.use(basicAuth({
+        users: { 'admin': process.env.ADMIN_PASSWORD },
+        challenge: true,
+        unauthorizedResponse: 'Unauthorized'
+    }));
+    console.log("🔒 หน้าเว็บต้องใช้รหัสผ่าน admin");
+}
+
 let CONFIG = null;
 let totalClaimed = 0;
 let totalFailed = 0;
@@ -45,6 +55,14 @@ let otpCode = "";
 let passwordCode = "";
 let client = null;
 
+// ========== ฟังก์ชันปกปิดเบอร์ ==========
+function maskPhone(phone) {
+    if (!phone) return '';
+    let str = phone.toString().trim();
+    if (str.length <= 4) return '***';
+    return str.slice(0, -4) + '****' + str.slice(-2);
+}
+
 // Cache สำหรับ voucher ที่เพิ่งเห็น (กันซ้ำ)
 const recentSeen = new Map();
 function isDuplicate(voucher) {
@@ -52,7 +70,6 @@ function isDuplicate(voucher) {
     recentSeen.set(voucher, Date.now());
     return false;
 }
-// ทำความสะอาด cache ทุก 1 นาที
 setInterval(() => {
     const now = Date.now();
     for (let [k, t] of recentSeen) {
@@ -65,10 +82,8 @@ function hasThai(text) {
     return /[\u0E00-\u0E7F]/.test(text);
 }
 
-// แปลงตัวเลขภาษาไทยเป็นตัวเลข
 const thaiMap = {"เก้าสิบเก้า":"99","เก้าสิบแปด":"98","เก้าสิบเจ็ด":"97","เก้าสิบหก":"96","เก้าสิบห้า":"95","เก้าสิบสี่":"94","เก้าสิบสาม":"93","เก้าสิบสอง":"92","เก้าสิบเอ็ด":"91","เก้าสิบ":"90","แปดสิบเก้า":"89","แปดสิบแปด":"88","แปดสิบเจ็ด":"87","แปดสิบหก":"86","แปดสิบห้า":"85","แปดสิบสี่":"84","แปดสิบสาม":"83","แปดสิบสอง":"82","แปดสิบเอ็ด":"81","แปดสิบ":"80","เจ็ดสิบเก้า":"79","เจ็ดสิบแปด":"78","เจ็ดสิบเจ็ด":"77","เจ็ดสิบหก":"76","เจ็ดสิบห้า":"75","เจ็ดสิบสี่":"74","เจ็ดสิบสาม":"73","เจ็ดสิบสอง":"72","เจ็ดสิบเอ็ด":"71","เจ็ดสิบ":"70","หกสิบเก้า":"69","หกสิบแปด":"68","หกสิบเจ็ด":"67","หกสิบหก":"66","หกสิบห้า":"65","หกสิบสี่":"64","หกสิบสาม":"63","หกสิบสอง":"62","หกสิบเอ็ด":"61","หกสิบ":"60","ห้าสิบเก้า":"59","ห้าสิบแปด":"58","ห้าสิบเจ็ด":"57","ห้าสิบหก":"56","ห้าสิบห้า":"55","ห้าสิบสี่":"54","ห้าสิบสาม":"53","ห้าสิบสอง":"52","ห้าสิบเอ็ด":"51","ห้าสิบ":"50","สี่สิบเก้า":"49","สี่สิบแปด":"48","สี่สิบเจ็ด":"47","สี่สิบหก":"46","สี่สิบห้า":"45","สี่สิบสี่":"44","สี่สิบสาม":"43","สี่สิบสอง":"42","สี่สิบเอ็ด":"41","สี่สิบ":"40","สามสิบเก้า":"39","สามสิบแปด":"38","สามสิบเจ็ด":"37","สามสิบหก":"36","สามสิบห้า":"35","สามสิบสี่":"34","สามสิบสาม":"33","สามสิบสอง":"32","สามสิบเอ็ด":"31","สามสิบ":"30","ยี่สิบเก้า":"29","ยี่สิบแปด":"28","ยี่สิบเจ็ด":"27","ยี่สิบหก":"26","ยี่สิบห้า":"25","ยี่สิบสี่":"24","ยี่สิบสาม":"23","ยี่สิบสอง":"22","ยี่สิบเอ็ด":"21","ยี่สิบ":"20","สิบเก้า":"19","สิบแปด":"18","สิบเจ็ด":"17","สิบหก":"16","สิบห้า":"15","สิบสี่":"14","สิบสาม":"13","สิบสอง":"12","สิบเอ็ด":"11","สิบ":"10","ศูนย์":"0","หนึ่ง":"1","สอง":"2","สาม":"3","สี่":"4","ห้า":"5","หก":"6","เจ็ด":"7","แปด":"8","เก้า":"9","เอ็ด":"1","ยี่":"2"};
 const thaiKeys = Object.keys(thaiMap).sort((a,b)=>b.length-a.length);
-const thaiRegex = new RegExp(thaiKeys.join('|'), 'gi');
 
 function decodeThai(text) {
     if (!text) return text;
@@ -87,7 +102,6 @@ function isLikelyVoucher(s) {
 
 async function decodeQR(buffer) {
     try {
-        // ข้ามไฟล์เล็กเกินไป (ไม่น่าเป็น QR)
         if (buffer.length < 2000) return null;
         const { data, info } = await sharp(buffer)
             .raw()
@@ -190,11 +204,12 @@ app.get('/', (req, res) => {
             <h1>🚀 TrueMoney Bot</h1>
             <div class="success">✅ บอทกำลังทำงาน</div>
             <div class="stat"><div>รับสำเร็จ<span style="color:#10b981">${totalClaimed}</span></div><div>ล้มเหลว<span style="color:#ef4444">${totalFailed}</span></div><div>ยอดรวม<span style="color:#f59e0b">${totalAmount}฿</span></div></div>
-            <div class="info">📱 เบอร์: ${CONFIG.phoneNumber}</div><div class="info">💰 กระเป๋า: ${CONFIG.walletName}</div>
+            <div class="info">📱 เบอร์: ${maskPhone(CONFIG.phoneNumber)}</div>
+            <div class="info">💰 กระเป๋า: ${CONFIG.walletName} (${maskPhone(CONFIG.walletNumber)})</div>
             <button onclick="if(confirm('ต้องการตั้งค่าใหม่?')){location.href='/reset'}" style="background:#ef4444;margin-top:20px">🔄 ตั้งค่าใหม่</button>
         `));
     } else if (loginStep === "need-send-otp") {
-        res.send(html("Login", `<h1>📱 Login Telegram</h1><div class="warning">📮 กดปุ่มด้านล่างเพื่อส่ง OTP</div><div class="info">เบอร์: ${CONFIG.phoneNumber}</div><form action="/send-otp" method="POST"><button type="submit">📨 ส่ง OTP</button></form>`));
+        res.send(html("Login", `<h1>📱 Login Telegram</h1><div class="warning">📮 กดปุ่มด้านล่างเพื่อส่ง OTP</div><div class="info">เบอร์: ${maskPhone(CONFIG.phoneNumber)}</div><form action="/send-otp" method="POST"><button type="submit">📨 ส่ง OTP</button></form>`));
     } else if (loginStep === "need-otp") {
         res.send(html("OTP", `<h1>🔑 ใส่รหัส OTP</h1><div class="warning">📱 ตรวจสอบรหัส OTP ใน Telegram</div><form action="/verify-otp" method="POST"><input type="text" name="otp" placeholder="12345" maxlength="5" required autofocus><button type="submit">✅ ยืนยัน</button></form>`));
     } else if (loginStep === "need-password") {
@@ -214,7 +229,7 @@ app.post('/save-config', async (req, res) => {
     };
     const envContent = `API_ID=${CONFIG.apiId}\nAPI_HASH=${CONFIG.apiHash}\nPHONE_NUMBER=${CONFIG.phoneNumber}\nWALLET_NUMBER=${CONFIG.walletNumber}\nWALLET_NAME=${CONFIG.walletName}`;
     fs.writeFileSync('.env', envContent);
-    res.send(html("บันทึกสำเร็จ", `<h1>✅ บันทึกการตั้งค่าสำเร็จ</h1><div class="success">กำลังเริ่มต้นบอท...</div><div class="info">📱 เบอร์: ${CONFIG.phoneNumber}<br>💰 กระเป๋า: ${CONFIG.walletName}</div><script>setTimeout(()=>location.href='/',2000)</script>`));
+    res.send(html("บันทึกสำเร็จ", `<h1>✅ บันทึกการตั้งค่าสำเร็จ</h1><div class="success">กำลังเริ่มต้นบอท...</div><div class="info">📱 เบอร์: ${maskPhone(CONFIG.phoneNumber)}<br>💰 กระเป๋า: ${CONFIG.walletName} (${maskPhone(CONFIG.walletNumber)})</div><script>setTimeout(()=>location.href='/',2000)</script>`));
     setTimeout(() => startBot(), 3000);
 });
 
@@ -306,7 +321,6 @@ async function startBot() {
         try {
             const msg = event.message;
             if (!msg) return;
-            // รูปภาพ
             if (msg.media?.className === "MessageMediaPhoto") {
                 const buffer = await client.downloadMedia(msg.media, { workers: 1 });
                 if (buffer) {
@@ -319,7 +333,6 @@ async function startBot() {
                     }
                 }
             }
-            // ข้อความปกติ
             if (msg.message) {
                 const vouchers = extractVoucher(msg.message);
                 if (vouchers) {
@@ -333,7 +346,6 @@ async function startBot() {
     console.log("✅ บอทพร้อมทำงานแล้ว!\n");
 }
 
-// เริ่มต้นถ้ามี .env อยู่แล้ว
 if (fs.existsSync('.env')) {
     require('dotenv').config();
     if (process.env.API_ID && process.env.API_HASH) {
