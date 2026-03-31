@@ -1,6 +1,6 @@
 {
   "name": "truemoney-auto-claim",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Auto claim TrueMoney with tw-voucher (No Proxy)",
   "main": "index.js",
   "type": "commonjs",
