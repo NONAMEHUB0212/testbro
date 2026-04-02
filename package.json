@@ -1,27 +1,27 @@
 {
   "name": "truemoney-auto-claim",
   "version": "1.0.0",
-  "description": "Auto claim TrueMoney with tw-voucher (No Proxy)",
+  "description": "Auto claim TrueMoney with tw-voucher (Supabase for persistent session)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "keywords": ["telegram", "truemoney"],
-  "author": "AutoClaim",
+  "keywords": ["telegram", "truemoney", "autoclaim", "supabase"],
+  "author": "tawan_x2noban",
   "license": "MIT",
   "dependencies": {
-    "telegram": "^2.22.2",
-    "axios": "^1.6.2",
-    "express": "^4.18.2",
-    "jsqr": "^1.4.0",
-    "dotenv": "^16.3.1",
-    "body-parser": "^1.20.2",
     "@fortune-inc/tw-voucher": "^1.0.0",
-    "sharp": "^0.33.4",
-    "p-limit": "^4.0.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.6.2",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
     "express-basic-auth": "^1.2.1",
-    "mongodb": "^6.3.0"
+    "jsqr": "^1.4.0",
+    "p-limit": "^4.0.0",
+    "sharp": "^0.33.4",
+    "telegram": "^2.22.2"
   },
   "engines": {
     "node": ">=18.0.0"
