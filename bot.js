@@ -31,7 +31,7 @@ if (process.env.MONGODB_URI) {
     useMongo = true;
 }
 
-// ========== p-limit ==========
+// ========== p-limit (รองรับ CommonJS/ESM) ==========
 let pLimit;
 try {
     const pl = require('p-limit');
@@ -39,7 +39,7 @@ try {
 } catch (e) {
     pLimit = (concurrency) => (fn) => fn();
 }
-const limit = pLimit(1);
+const limit = pLimit(1); // รีดีมทีละ 1
 
 // ========== tw-voucher ==========
 let twvoucher;
@@ -83,7 +83,7 @@ function maskPhone(phone) {
     return str.slice(0, -4) + '****' + str.slice(-2);
 }
 
-// Cache voucher
+// Cache สำหรับ voucher
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -137,7 +137,7 @@ async function loadSession() {
     return null;
 }
 
-// ========== ฟังก์ชันช่วยเหลือ ==========
+// ========== ฟังก์ชันช่วยเหลือ (ภาษาไทย, QR) ==========
 function hasThai(text) {
     return /[\u0E00-\u0E7F]/.test(text);
 }
@@ -203,19 +203,18 @@ async function processVoucher(voucher, source, startTime) {
     const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
     const walletName = CONFIG.walletName || "กระเป๋าหลัก";
     
-    // ส่ง Webhook แจ้งเจอ Voucher ใหม่ (ก่อนรีดีม)
+    // แจ้งเจอ voucher ก่อนรีดีม
     const newVoucherMsg = `🎫 เจอ VOUCHER ใหม่\n🔑 ลิ้ง ${fullUrl}\n📱 แหล่งที่มา 💳 "${source}"\n📦 เข้าการเป๋า ${walletName}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`;
     await sendWebhook(newVoucherMsg);
     
     console.log(`📥 ${voucher} (จาก ${source})`);
     const phone = CONFIG.walletNumber.replace(/\s/g, '');
     const voucherUrl = fullUrl;
-    const elapsed = Date.now() - startTime;
+    const start = startTime || Date.now();
     
     try {
         const result = await twvoucher(phone, voucherUrl);
-        const endTime = Date.now();
-        const speedMs = endTime - startTime;
+        const speedMs = Date.now() - start;
         
         if (result && result.amount) {
             const amount = parseFloat(result.amount);
@@ -241,7 +240,7 @@ async function processVoucher(voucher, source, startTime) {
         }
     } catch (err) {
         totalFailed++;
-        const speedMs = Date.now() - startTime;
+        const speedMs = Date.now() - start;
         console.log(`❌ ${err.message} (${speedMs}ms)`);
         
         const errorMsg = `🎪 เกิดข้อผิดพลาด\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
@@ -421,10 +420,15 @@ async function startBot() {
                 source = msg.chat.title || msg.chat.username || msg.chat.id?.toString() || "Unknown";
             }
             
-            // รูปภาพ
+            // รูปภาพ – ใช้ Promise.race เพื่อป้องกัน timeout
             if (msg.media?.className === "MessageMediaPhoto") {
                 try {
-                    const buffer = await client.downloadMedia(msg.media, { workers: 1, timeout: 10000 });
+                    const downloadPromise = client.downloadMedia(msg.media, { workers: 1 });
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Download timeout')), 8000)
+                    );
+                    const buffer = await Promise.race([downloadPromise, timeoutPromise]);
+                    
                     if (buffer && buffer.length > 2000) {
                         const qrData = await decodeQR(buffer);
                         if (qrData) {
