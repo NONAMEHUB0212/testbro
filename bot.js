@@ -22,24 +22,26 @@ async function sendWebhook(content) {
     }
 }
 
-// ========== MongoDB (ใช้ tlsAllowInvalidCertificates เท่านั้น) ==========
+// ========== MongoDB (ใช้ tlsAllowInvalidCertificates ใน options) ==========
 let mongoClient, db;
 let useMongo = false;
 if (process.env.MONGODB_URI) {
     const { MongoClient } = require('mongodb');
     let uri = process.env.MONGODB_URI;
-    // เพิ่ม tlsAllowInvalidCertificates ถ้ายังไม่มีใน query string
-    if (!uri.includes('tlsAllowInvalidCertificates')) {
-        const separator = uri.includes('?') ? '&' : '?';
-        uri += `${separator}tlsAllowInvalidCertificates=true`;
-    }
+    // ลบ query parameters ที่เกี่ยวข้องกับ SSL ออกจาก URI เพื่อไม่ให้ซ้ำซ้อน
+    uri = uri.replace(/[?&]tlsAllowInvalidCertificates=[^&]*/g, '');
+    uri = uri.replace(/[?&]tlsInsecure=[^&]*/g, '');
+    // ทำความสะอาดเครื่องหมาย ? หรือ & ที่เหลือ
+    if (uri.endsWith('?') || uri.endsWith('&')) uri = uri.slice(0, -1);
+    
     mongoClient = new MongoClient(uri, {
+        tlsAllowInvalidCertificates: true,   // สำคัญสำหรับ SSL error
         serverSelectionTimeoutMS: 5000,
         socketTimeoutMS: 30000,
         connectTimeoutMS: 10000
     });
     useMongo = true;
-    console.log("📡 กำลังเชื่อมต่อ MongoDB ด้วย URI ที่ปรับแล้ว");
+    console.log("📡 กำลังเชื่อมต่อ MongoDB ด้วย options tlsAllowInvalidCertificates");
 }
 
 // ========== p-limit (รองรับ CommonJS/ESM) ==========
