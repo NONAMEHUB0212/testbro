@@ -22,29 +22,24 @@ async function sendWebhook(content) {
     }
 }
 
-// ========== MongoDB (ใช้ tlsAllowInvalidCertificates ใน options) ==========
-let mongoClient, db;
-let useMongo = false;
-if (process.env.MONGODB_URI) {
-    const { MongoClient } = require('mongodb');
-    let uri = process.env.MONGODB_URI;
-    // ลบ query parameters ที่เกี่ยวข้องกับ SSL ออกจาก URI เพื่อไม่ให้ซ้ำซ้อน
-    uri = uri.replace(/[?&]tlsAllowInvalidCertificates=[^&]*/g, '');
-    uri = uri.replace(/[?&]tlsInsecure=[^&]*/g, '');
-    // ทำความสะอาดเครื่องหมาย ? หรือ & ที่เหลือ
-    if (uri.endsWith('?') || uri.endsWith('&')) uri = uri.slice(0, -1);
-    
-    mongoClient = new MongoClient(uri, {
-        tlsAllowInvalidCertificates: true,   // สำคัญสำหรับ SSL error
-        serverSelectionTimeoutMS: 5000,
-        socketTimeoutMS: 30000,
-        connectTimeoutMS: 10000
-    });
-    useMongo = true;
-    console.log("📡 กำลังเชื่อมต่อ MongoDB ด้วย options tlsAllowInvalidCertificates");
+// ========== Supabase (แทน MongoDB) ==========
+const { createClient } = require('@supabase/supabase-js');
+let supabase = null;
+let useSupabase = false;
+
+// รองรับทั้งชื่อตัวแปรแบบ NEXT_PUBLIC_ และแบบตรง
+const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY || process.env.SUPABASE_PUBLISHABLE_DEFAULT_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY;
+
+if (supabaseUrl && supabaseKey) {
+    supabase = createClient(supabaseUrl, supabaseKey);
+    useSupabase = true;
+    console.log("📡 กำลังเชื่อมต่อ Supabase");
+} else {
+    console.log("⚠️ ไม่พบ Supabase credentials จะใช้ไฟล์ session.txt แทน");
 }
 
-// ========== p-limit (รองรับ CommonJS/ESM) ==========
+// ========== p-limit ==========
 let pLimit;
 try {
     const pl = require('p-limit');
@@ -52,7 +47,7 @@ try {
 } catch (e) {
     pLimit = (concurrency) => (fn) => fn();
 }
-const limit = pLimit(1); // รีดีมทีละ 1
+const limit = pLimit(1);
 
 // ========== tw-voucher ==========
 let twvoucher;
@@ -96,7 +91,7 @@ function maskPhone(phone) {
     return str.slice(0, -4) + '****' + str.slice(-2);
 }
 
-// Cache สำหรับ voucher
+// Cache voucher
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -110,16 +105,26 @@ setInterval(() => {
     }
 }, 60000);
 
-// ========== Session Management ==========
+// ========== Session Management (Supabase / fallback file) ==========
 async function saveSession(sessionString) {
-    if (useMongo) {
-        if (!db) db = mongoClient.db('truemoney');
-        await db.collection('sessions').updateOne(
-            { _id: 'telegram_session' },
-            { $set: { session: sessionString, updatedAt: new Date() } },
-            { upsert: true }
-        );
-        console.log("💾 บันทึก session ลง MongoDB เรียบร้อย");
+    if (useSupabase) {
+        try {
+            const { error } = await supabase
+                .from('sessions')
+                .upsert({ id: 'telegram_session', session: sessionString, updated_at: new Date() });
+            if (error) {
+                console.error("❌ Supabase บันทึก session ล้มเหลว:", error.message);
+                // fallback to file
+                fs.writeFileSync('session.txt', sessionString, 'utf8');
+                console.log("💾 บันทึก session ลงไฟล์ session.txt (fallback)");
+            } else {
+                console.log("💾 บันทึก session ลง Supabase เรียบร้อย");
+            }
+        } catch (err) {
+            console.error("❌ Supabase error:", err.message);
+            fs.writeFileSync('session.txt', sessionString, 'utf8');
+            console.log("💾 บันทึก session ลงไฟล์ session.txt (fallback)");
+        }
     } else {
         fs.writeFileSync('session.txt', sessionString, 'utf8');
         console.log("💾 บันทึก session ลงไฟล์ session.txt");
@@ -127,22 +132,30 @@ async function saveSession(sessionString) {
 }
 
 async function loadSession() {
+    // 1. Environment variable SESSION_STRING (ถ้ามี)
     if (process.env.SESSION_STRING) {
         console.log("📂 ใช้ session จาก environment variable");
         return process.env.SESSION_STRING;
     }
-    if (useMongo) {
+    // 2. Supabase
+    if (useSupabase) {
         try {
-            if (!db) db = mongoClient.db('truemoney');
-            const doc = await db.collection('sessions').findOne({ _id: 'telegram_session' });
-            if (doc && doc.session) {
-                console.log("📂 โหลด session จาก MongoDB สำเร็จ");
-                return doc.session;
+            const { data, error } = await supabase
+                .from('sessions')
+                .select('session')
+                .eq('id', 'telegram_session')
+                .maybeSingle();
+            if (data && data.session) {
+                console.log("📂 โหลด session จาก Supabase สำเร็จ");
+                return data.session;
+            } else if (error) {
+                console.error("⚠️ โหลด session จาก Supabase ล้มเหลว:", error.message);
             }
         } catch (err) {
-            console.error("⚠️ โหลด session จาก MongoDB ล้มเหลว:", err.message);
+            console.error("⚠️ Supabase error:", err.message);
         }
     }
+    // 3. ไฟล์ session.txt
     if (fs.existsSync('session.txt')) {
         console.log("📂 โหลด session จากไฟล์ session.txt");
         return fs.readFileSync('session.txt', 'utf8').trim();
@@ -256,7 +269,7 @@ async function processVoucher(voucher, source, startTime) {
     }
 }
 
-// ========== หน้าเว็บ (Express) ==========
+// ========== หน้าเว็บ (Express) – ใช้ html เดิม ==========
 const html = (title, body) => `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title}</title>
@@ -286,6 +299,7 @@ a:hover{text-decoration:underline}
 </style>
 </head><body><div class="box">${body}</div></body></html>`;
 
+// Express routes (เหมือนเดิม)
 app.get('/', (req, res) => {
     if (!CONFIG) {
         res.send(html("ตั้งค่าบอท", `
@@ -458,29 +472,17 @@ async function startBot() {
     console.log("✅ บอทพร้อมทำงานแล้ว!\n");
 }
 
-// เริ่มต้น MongoDB และ config
-(async () => {
-    if (useMongo) {
-        try {
-            await mongoClient.connect();
-            db = mongoClient.db('truemoney');
-            console.log("✅ เชื่อมต่อ MongoDB สำเร็จ");
-        } catch (err) {
-            console.error("❌ เชื่อมต่อ MongoDB ล้มเหลว:", err.message);
-            useMongo = false;
-        }
+// เริ่มต้นบอทถ้ามี .env
+if (fs.existsSync('.env')) {
+    require('dotenv').config();
+    if (process.env.API_ID && process.env.API_HASH) {
+        CONFIG = {
+            apiId: parseInt(process.env.API_ID),
+            apiHash: process.env.API_HASH,
+            phoneNumber: process.env.PHONE_NUMBER,
+            walletNumber: process.env.WALLET_NUMBER,
+            walletName: process.env.WALLET_NAME || "กระเป๋าหลัก"
+        };
+        startBot();
     }
-    if (fs.existsSync('.env')) {
-        require('dotenv').config();
-        if (process.env.API_ID && process.env.API_HASH) {
-            CONFIG = {
-                apiId: parseInt(process.env.API_ID),
-                apiHash: process.env.API_HASH,
-                phoneNumber: process.env.PHONE_NUMBER,
-                walletNumber: process.env.WALLET_NUMBER,
-                walletName: process.env.WALLET_NAME || "กระเป๋าหลัก"
-            };
-            startBot();
-        }
-    }
-})();
+}
