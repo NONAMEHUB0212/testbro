@@ -7,89 +7,58 @@ const bodyParser = require("body-parser");
 const sharp = require("sharp");
 const jsQR = require("jsqr");
 const fs = require("fs");
+const WebSocket = require("ws");
+const cloudscraper = require("cloudscraper");
 require("dotenv").config();
 
-// ========== Webhook ==========
+// ========== Webhook (Discord) ==========
 const webhookUrls = process.env.WEBHOOK_URL ? process.env.WEBHOOK_URL.split(',').map(u => u.trim()) : [];
-async function sendWebhook(content) {
+async function sendDiscordEmbed(title, description, color = 5763719, fields = []) {
     if (!webhookUrls.length) return;
+    const embed = { title, description, color, timestamp: new Date().toISOString(), fields };
     for (const url of webhookUrls) {
         try {
-            await axios.post(url, { content }, { timeout: 5000 });
-        } catch (err) {
-            console.error(`⚠️ ส่ง Webhook ล้มเหลว: ${err.message}`);
-        }
+            await axios.post(url, { embeds: [embed] }, { timeout: 5000 });
+        } catch (err) { /* silent */ }
+    }
+}
+async function sendDiscordSimple(content) {
+    if (!webhookUrls.length) return;
+    for (const url of webhookUrls) {
+        try { await axios.post(url, { content }, { timeout: 5000 }); } catch (err) { }
     }
 }
 
-// ========== Supabase (แทน MongoDB) ==========
+// ========== Supabase Session ==========
 const { createClient } = require('@supabase/supabase-js');
 let supabase = null;
-let useSupabase = false;
-
-// รองรับทั้งชื่อตัวแปรแบบ NEXT_PUBLIC_ และแบบตรง
 const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY || process.env.SUPABASE_PUBLISHABLE_DEFAULT_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY;
-
 if (supabaseUrl && supabaseKey) {
     supabase = createClient(supabaseUrl, supabaseKey);
-    useSupabase = true;
-    console.log("📡 กำลังเชื่อมต่อ Supabase");
-} else {
-    console.log("⚠️ ไม่พบ Supabase credentials จะใช้ไฟล์ session.txt แทน");
+    console.log("📡 ใช้ Supabase เก็บ session");
 }
 
 // ========== p-limit ==========
 let pLimit;
-try {
-    const pl = require('p-limit');
-    pLimit = typeof pl === 'function' ? pl : pl.default;
-} catch (e) {
-    pLimit = (concurrency) => (fn) => fn();
-}
-const limit = pLimit(1);
+try { const pl = require('p-limit'); pLimit = typeof pl === 'function' ? pl : pl.default; } catch (e) { pLimit = () => (fn) => fn(); }
+const limit = pLimit(1);  // จำกัด concurrency การรีดีม
 
-// ========== tw-voucher ==========
-let twvoucher;
-const twPackage = require('@fortune-inc/tw-voucher');
-if (typeof twPackage === 'function') {
-    twvoucher = twPackage;
-} else if (twPackage.voucher && typeof twPackage.voucher === 'function') {
-    twvoucher = twPackage.voucher;
-} else {
-    twvoucher = twPackage.default || twPackage;
-}
-
-// ========== Express & Auth ==========
+// ========== Express + WebSocket ==========
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
+// Basic Auth (optional)
 if (process.env.ADMIN_PASSWORD) {
     const basicAuth = require('express-basic-auth');
-    app.use(basicAuth({
-        users: { 'admin': process.env.ADMIN_PASSWORD },
-        challenge: true,
-        unauthorizedResponse: 'Unauthorized'
-    }));
+    app.use(basicAuth({ users: { 'admin': process.env.ADMIN_PASSWORD }, challenge: true, unauthorizedResponse: 'Unauthorized' }));
     console.log("🔒 หน้าเว็บต้องใช้รหัสผ่าน admin");
 }
 
 let CONFIG = null;
-let totalClaimed = 0;
-let totalFailed = 0;
-let totalAmount = 0;
-let loginStep = "need-config";
-let otpCode = "";
-let passwordCode = "";
-let client = null;
-
-function maskPhone(phone) {
-    if (!phone) return '';
-    let str = phone.toString().trim();
-    if (str.length <= 4) return '***';
-    return str.slice(0, -4) + '****' + str.slice(-2);
-}
+let totalClaimed = 0, totalFailed = 0, totalAmount = 0;
+let loginStep = "need-config", otpCode = "", passwordCode = "", client = null;
 
 // Cache voucher
 const recentSeen = new Map();
@@ -100,379 +69,332 @@ function isDuplicate(voucher) {
 }
 setInterval(() => {
     const now = Date.now();
-    for (let [k, t] of recentSeen) {
-        if (now - t > 30000) recentSeen.delete(k);
-    }
+    for (let [k, t] of recentSeen) if (now - t > 30000) recentSeen.delete(k);
 }, 60000);
 
-// ========== Session Management (Supabase / fallback file) ==========
-async function saveSession(sessionString) {
-    if (useSupabase) {
-        try {
-            const { error } = await supabase
-                .from('sessions')
-                .upsert({ id: 'telegram_session', session: sessionString, updated_at: new Date() });
-            if (error) {
-                console.error("❌ Supabase บันทึก session ล้มเหลว:", error.message);
-                // fallback to file
-                fs.writeFileSync('session.txt', sessionString, 'utf8');
-                console.log("💾 บันทึก session ลงไฟล์ session.txt (fallback)");
-            } else {
-                console.log("💾 บันทึก session ลง Supabase เรียบร้อย");
-            }
-        } catch (err) {
-            console.error("❌ Supabase error:", err.message);
-            fs.writeFileSync('session.txt', sessionString, 'utf8');
-            console.log("💾 บันทึก session ลงไฟล์ session.txt (fallback)");
-        }
-    } else {
-        fs.writeFileSync('session.txt', sessionString, 'utf8');
-        console.log("💾 บันทึก session ลงไฟล์ session.txt");
+// ระบบแจกจ่ายเบอร์
+let userClaimIndex = 0;
+function getClaimPhone(distribution, ownerPhone, userPhones) {
+    if (distribution === "owner_only") return ownerPhone;
+    if (distribution === "round_robin") {
+        const all = [ownerPhone, ...userPhones];
+        if (!all.length) return ownerPhone;
+        const phone = all[userClaimIndex % all.length];
+        userClaimIndex++;
+        return phone;
     }
+    if (distribution === "users_only") {
+        if (!userPhones.length) return ownerPhone;
+        const phone = userPhones[userClaimIndex % userPhones.length];
+        userClaimIndex++;
+        return phone;
+    }
+    return ownerPhone;
 }
 
-async function loadSession() {
-    // 1. Environment variable SESSION_STRING (ถ้ามี)
-    if (process.env.SESSION_STRING) {
-        console.log("📂 ใช้ session จาก environment variable");
-        return process.env.SESSION_STRING;
-    }
-    // 2. Supabase
-    if (useSupabase) {
+// ========== Session Management ==========
+async function saveSession(sessionString) {
+    if (supabase) {
         try {
-            const { data, error } = await supabase
-                .from('sessions')
-                .select('session')
-                .eq('id', 'telegram_session')
-                .maybeSingle();
-            if (data && data.session) {
-                console.log("📂 โหลด session จาก Supabase สำเร็จ");
-                return data.session;
-            } else if (error) {
-                console.error("⚠️ โหลด session จาก Supabase ล้มเหลว:", error.message);
-            }
-        } catch (err) {
-            console.error("⚠️ Supabase error:", err.message);
-        }
+            await supabase.from('sessions').upsert({ id: 'telegram_session', session: sessionString, updated_at: new Date() });
+            console.log("💾 session เก็บใน Supabase");
+        } catch (err) { console.error("Supabase error:", err.message); fs.writeFileSync('session.txt', sessionString); }
+    } else { fs.writeFileSync('session.txt', sessionString); }
+}
+async function loadSession() {
+    if (process.env.SESSION_STRING) return process.env.SESSION_STRING;
+    if (supabase) {
+        try {
+            const { data } = await supabase.from('sessions').select('session').eq('id', 'telegram_session').maybeSingle();
+            if (data?.session) return data.session;
+        } catch (err) { console.error("Supabase load error:", err.message); }
     }
-    // 3. ไฟล์ session.txt
-    if (fs.existsSync('session.txt')) {
-        console.log("📂 โหลด session จากไฟล์ session.txt");
-        return fs.readFileSync('session.txt', 'utf8').trim();
-    }
+    if (fs.existsSync('session.txt')) return fs.readFileSync('session.txt', 'utf8').trim();
     return null;
 }
 
-// ========== ฟังก์ชันช่วยเหลือ (ภาษาไทย, QR) ==========
-function hasThai(text) {
-    return /[\u0E00-\u0E7F]/.test(text);
-}
-
-const thaiMap = {
-    "เก้าสิบเก้า":"99","เก้าสิบแปด":"98","เก้าสิบเจ็ด":"97","เก้าสิบหก":"96","เก้าสิบห้า":"95","เก้าสิบสี่":"94","เก้าสิบสาม":"93","เก้าสิบสอง":"92","เก้าสิบเอ็ด":"91","เก้าสิบ":"90",
-    "แปดสิบเก้า":"89","แปดสิบแปด":"88","แปดสิบเจ็ด":"87","แปดสิบหก":"86","แปดสิบห้า":"85","แปดสิบสี่":"84","แปดสิบสาม":"83","แปดสิบสอง":"82","แปดสิบเอ็ด":"81","แปดสิบ":"80",
-    "เจ็ดสิบเก้า":"79","เจ็ดสิบแปด":"78","เจ็ดสิบเจ็ด":"77","เจ็ดสิบหก":"76","เจ็ดสิบห้า":"75","เจ็ดสิบสี่":"74","เจ็ดสิบสาม":"73","เจ็ดสิบสอง":"72","เจ็ดสิบเอ็ด":"71","เจ็ดสิบ":"70",
-    "หกสิบเก้า":"69","หกสิบแปด":"68","หกสิบเจ็ด":"67","หกสิบหก":"66","หกสิบห้า":"65","หกสิบสี่":"64","หกสิบสาม":"63","หกสิบสอง":"62","หกสิบเอ็ด":"61","หกสิบ":"60",
-    "ห้าสิบเก้า":"59","ห้าสิบแปด":"58","ห้าสิบเจ็ด":"57","ห้าสิบหก":"56","ห้าสิบห้า":"55","ห้าสิบสี่":"54","ห้าสิบสาม":"53","ห้าสิบสอง":"52","ห้าสิบเอ็ด":"51","ห้าสิบ":"50",
-    "สี่สิบเก้า":"49","สี่สิบแปด":"48","สี่สิบเจ็ด":"47","สี่สิบหก":"46","สี่สิบห้า":"45","สี่สิบสี่":"44","สี่สิบสาม":"43","สี่สิบสอง":"42","สี่สิบเอ็ด":"41","สี่สิบ":"40",
-    "สามสิบเก้า":"39","สามสิบแปด":"38","สามสิบเจ็ด":"37","สามสิบหก":"36","สามสิบห้า":"35","สามสิบสี่":"34","สามสิบสาม":"33","สามสิบสอง":"32","สามสิบเอ็ด":"31","สามสิบ":"30",
-    "ยี่สิบเก้า":"29","ยี่สิบแปด":"28","ยี่สิบเจ็ด":"27","ยี่สิบหก":"26","ยี่สิบห้า":"25","ยี่สิบสี่":"24","ยี่สิบสาม":"23","ยี่สิบสอง":"22","ยี่สิบเอ็ด":"21","ยี่สิบ":"20",
-    "สิบเก้า":"19","สิบแปด":"18","สิบเจ็ด":"17","สิบหก":"16","สิบห้า":"15","สิบสี่":"14","สิบสาม":"13","สิบสอง":"12","สิบเอ็ด":"11","สิบ":"10",
-    "ศูนย์":"0","หนึ่ง":"1","สอง":"2","สาม":"3","สี่":"4","ห้า":"5","หก":"6","เจ็ด":"7","แปด":"8","เก้า":"9","เอ็ด":"1","ยี่":"2"
-};
-const thaiKeys = Object.keys(thaiMap).sort((a,b)=>b.length-a.length);
-
-function decodeThai(text) {
-    if (!text || !hasThai(text)) return text;
-    let decoded = text;
-    for (const key of thaiKeys) {
-        decoded = decoded.replace(new RegExp(key, 'gi'), thaiMap[key]);
-    }
-    return decoded.replace(/[^a-zA-Z0-9]/g, '');
-}
-
-function isLikelyVoucher(s) {
-    return s && s.length >= 20 && s.length <= 64 && /^[a-zA-Z0-9]+$/.test(s);
-}
-
-async function decodeQR(buffer) {
-    try {
-        if (buffer.length < 2000) return null;
-        const { data, info } = await sharp(buffer)
-            .raw()
-            .toBuffer({ resolveWithObject: true });
-        const code = jsQR(new Uint8ClampedArray(data), info.width, info.height);
-        return code?.data || null;
-    } catch {
-        return null;
-    }
-}
-
-function extractVoucher(text) {
-    if (!text) return null;
-    const results = [];
-    const urlRegex = /https?:\/\/gift\.truemoney\.com\/campaign\/?\??.*?v=([a-zA-Z0-9]+)/gi;
-    const matches = [...text.matchAll(urlRegex)];
-    for (const match of matches) {
-        let voucher = match[1].trim();
-        if (hasThai(voucher)) voucher = decodeThai(voucher);
-        voucher = voucher.replace(/\s/g, '');
-        if (isLikelyVoucher(voucher)) results.push(voucher);
-    }
-    return results.length ? results : null;
-}
-
-// ========== รีดีมพร้อม Webhook ==========
-async function processVoucher(voucher, source, startTime) {
-    if (isDuplicate(voucher)) return;
+// ========== ฟังก์ชันรีดีมด้วย cloudscraper ==========
+async function claimWithCloudscraper(voucher, phone, retryCount = 0) {
+    const url = `https://gift.truemoney.com/campaign/vouchers/${voucher}/redeem`;
+    const payload = { mobile: phone.replace(/-/g, ''), voucher_hash: voucher };
+    const headers = {
+        'Referer': `https://gift.truemoney.com/campaign/?v=${voucher}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive'
+    };
     
+    return new Promise((resolve, reject) => {
+        cloudscraper.post(url, {
+            json: payload,
+            headers: headers,
+            timeout: 10000
+        }, (error, response, body) => {
+            if (error) return reject(error);
+            resolve(body);
+        });
+    });
+}
+
+async function claimForPhone(voucher, phone, startTime, role) {
     const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
-    const walletName = CONFIG.walletName || "กระเป๋าหลัก";
-    
-    const newVoucherMsg = `🎫 เจอ VOUCHER ใหม่\n🔑 ลิ้ง ${fullUrl}\n📱 แหล่งที่มา 💳 "${source}"\n📦 เข้าการเป๋า ${walletName}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`;
-    await sendWebhook(newVoucherMsg);
-    
-    console.log(`📥 ${voucher} (จาก ${source})`);
-    const phone = CONFIG.walletNumber.replace(/\s/g, '');
-    const voucherUrl = fullUrl;
-    const start = startTime || Date.now();
-    
     try {
-        const result = await twvoucher(phone, voucherUrl);
-        const speedMs = Date.now() - start;
-        
-        if (result && result.amount) {
-            const amount = parseFloat(result.amount);
+        const result = await claimWithCloudscraper(voucher, phone);
+        const ms = Date.now() - startTime;
+        if (result.status?.code === 'SUCCESS') {
+            const amount = parseFloat(result.data.my_ticket.amount_baht);
             totalClaimed++;
             totalAmount += amount;
-            console.log(`✅ +${amount}฿ (${speedMs}ms)`);
-            const successMsg = `🎪 รับซองสำเร็จแล้ว\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
-            await sendWebhook(successMsg);
-        } else {
-            totalFailed++;
-            const errorMsg = result?.message || 'ไม่ทราบสาเหตุ';
-            console.log(`❌ ${errorMsg} (${speedMs}ms)`);
-            let statusText = '';
-            if (errorMsg.includes('หมดอายุ')) statusText = '🎪 ซองหมดอายุ';
-            else if (errorMsg.includes('ไม่พบ')) statusText = '🎪 ไม่พบซอง';
-            else if (errorMsg.includes('หมดแล้ว')) statusText = '🎪 ซองหมดแล้ว';
-            else statusText = '🎪 ไม่สามารถรับซองได้';
-            const failMsg = `${statusText}\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
-            await sendWebhook(failMsg);
+            console.log(`✅ ${role}: +${amount}฿ (${ms}ms) เบอร์ ${phone.slice(-4)}`);
+            sendDiscordEmbed("🎯 TAWAN SNIPER", 
+                `✅ **รีดีมสำเร็จ**\n💰 ${amount} ฿\n⚡ ${ms}ms\n👤 ${role}\n🎫 \`${voucher}\``, 5763719);
+            return true;
+        } else if (result.status?.code === 'VOUCHER_OUT_OF_STOCK') {
+            console.log(`❌ ${role}: ซองหมดแล้ว (${ms}ms)`);
+            if (role === "Owner") sendDiscordEmbed("🎪 ซองหมดแล้ว", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
+            return true;
+        } else if (result.status?.code === 'VOUCHER_EXPIRED') {
+            console.log(`❌ ${role}: ซองหมดอายุ (${ms}ms)`);
+            if (role === "Owner") sendDiscordEmbed("🎪 ซองหมดอายุ", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
+            return true;
+        } else if (result.status?.code === 'VOUCHER_NOT_FOUND') {
+            console.log(`❌ ${role}: ไม่พบซอง (${ms}ms)`);
+            if (role === "Owner") sendDiscordEmbed("🎪 ไม่พบซอง", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
+            return true;
         }
+        console.log(`❌ ${role}: direct ล้มเหลว (${ms}ms) - ${result.status?.message || ''}`);
+        return false;
     } catch (err) {
-        totalFailed++;
-        const speedMs = Date.now() - start;
-        console.log(`❌ ${err.message} (${speedMs}ms)`);
-        const errorMsg = `🎪 เกิดข้อผิดพลาด\n🎫 ลิ้ง ${fullUrl}\n⚡ ความเร็ว ${speedMs} ms\n━━━━━━━━━━━━━━━━━━\nby tawan_x2noban`;
-        await sendWebhook(errorMsg);
+        console.log(`❌ ${role}: error - ${err.message}`);
+        return false;
     }
 }
 
-// ========== หน้าเว็บ (Express) – ใช้ html เดิม ==========
-const html = (title, body) => `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${title}</title>
+async function processVoucher(voucher, source, startTime) {
+    if (isDuplicate(voucher)) return;
+    const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
+    const distribution = CONFIG.distribution || "owner_only";
+    const ownerPhone = CONFIG.walletNumber;
+    const userPhones = CONFIG.userPhones ? CONFIG.userPhones.split(',').map(p => p.trim()) : [];
+    
+    // แจ้งเตือนพบ voucher
+    sendDiscordSimple(`🎫 เจอ VOUCHER ใหม่\n🔑 ${fullUrl}\n📱 แหล่งที่มา ${source}\n📦 เข้าการเป๋า ${distribution}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`);
+    
+    if (distribution === "owner_first_then_users") {
+        // Owner ก่อน
+        const ownerSuccess = await claimForPhone(voucher, ownerPhone, startTime, "Owner");
+        // รอ 10ms แล้วให้ users ทุกคน parallel
+        await new Promise(r => setTimeout(r, 10));
+        const userTasks = userPhones.map(phone => claimForPhone(voucher, phone, startTime, "User"));
+        await Promise.all(userTasks);
+    } else {
+        const targetPhone = getClaimPhone(distribution, ownerPhone, userPhones);
+        const success = await claimForPhone(voucher, targetPhone, startTime, "Main");
+        if (!success && CONFIG.fallbackApiUrl) {
+            // Fallback API
+            try {
+                const payload = { phone: targetPhone, voucher: voucher };
+                const fbRes = await axios.post(CONFIG.fallbackApiUrl, payload, { timeout: 8000 });
+                if (fbRes.data?.status === true && fbRes.data?.amount) {
+                    const amt = parseFloat(fbRes.data.amount);
+                    totalClaimed++; totalAmount += amt;
+                    console.log(`✅ Fallback: +${amt}฿ เบอร์ ${targetPhone.slice(-4)}`);
+                    sendDiscordEmbed("🎯 TAWAN SNIPER", `✅ **Fallback สำเร็จ**\n💰 ${amt} ฿\n🎫 \`${voucher}\``, 5763719);
+                } else {
+                    totalFailed++;
+                    sendDiscordEmbed("⚠️ คว้าล้มเหลว", `🎫 \`${voucher}\`\n❌ Direct + Fallback ล้มเหลว`, 15158332);
+                }
+            } catch (err) { totalFailed++; }
+        } else if (!success) totalFailed++;
+    }
+    // อัปเดตสถิติ (Dashboard)
+    updateDashboardStats();
+}
+
+// ========== ขยายลิงก์ย่อ ==========
+async function expandShortUrl(shortUrl) {
+    try {
+        const resp = await axios.head(shortUrl, { maxRedirects: 5, timeout: 5000 });
+        return resp.request.res.responseUrl || shortUrl;
+    } catch { return shortUrl; }
+}
+
+// ========== WebSocket Dashboard ==========
+const wss = new WebSocket.Server({ port: 10001 });
+let dashboardStats = { claimed: 0, failed: 0, total: 0, queue: 0, status: "พร้อม" };
+function updateDashboardStats() {
+    dashboardStats = { claimed: totalClaimed, failed: totalFailed, total: totalAmount, queue: 0, status: "ทำงาน" };
+    wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(dashboardStats)); });
+}
+
+// ========== Express Routes (หน้าเว็บ) ==========
+const htmlTemplate = (title, body) => `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
 .box{background:#fff;border-radius:15px;padding:40px;max-width:500px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.3)}
 h1{color:#667eea;margin-bottom:20px;font-size:28px;text-align:center}
-h2{color:#374151;font-size:18px;margin:20px 0 10px;border-bottom:2px solid #e5e7eb;padding-bottom:10px}
-input,button,textarea{width:100%;padding:15px;margin:10px 0;border-radius:8px;font-size:16px;border:2px solid #e5e7eb;transition:all 0.3s}
-input:focus,textarea:focus{outline:none;border-color:#667eea;box-shadow:0 0 0 3px rgba(102,126,234,0.1)}
+input,select,button{width:100%;padding:15px;margin:10px 0;border-radius:8px;font-size:16px;border:2px solid #e5e7eb}
 button{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;cursor:pointer;font-weight:600}
-button:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(102,126,234,0.3)}
-.info{background:#f0f9ff;padding:15px;border-radius:8px;margin:10px 0;font-size:14px;border-left:4px solid #3b82f6;color:#1e40af}
-.warning{background:#fef3c7;border-left-color:#f59e0b;color:#92400e}
-.success{background:#d1fae5;border-left-color:#10b981;color:#065f46}
-.stat{display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;margin:20px 0}
-.stat div{background:#f9fafb;padding:20px;border-radius:10px;text-align:center;border:2px solid #e5e7eb}
-.stat div span{display:block;font-size:32px;font-weight:bold;color:#667eea;margin-top:8px}
-.label{font-weight:600;color:#374151;margin:15px 0 5px;display:block}
-.note{font-size:12px;color:#6b7280;margin-top:5px}
-.code{background:#1f2937;color:#10b981;padding:8px 12px;border-radius:5px;font-family:monospace;font-size:14px;display:inline-block;margin:5px 0}
-.step{background:#f3f4f6;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #667eea}
-.step-num{background:#667eea;color:#fff;width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:bold;margin-right:10px}
-a{color:#667eea;text-decoration:none;font-weight:600}
-a:hover{text-decoration:underline}
+.info{background:#f0f9ff;padding:15px;border-radius:8px;margin:10px 0;font-size:14px}
 </style>
+<script>
+let ws;
+function connectWS() {
+    ws = new WebSocket('ws://' + location.hostname + ':10001');
+    ws.onmessage = (e) => { const d = JSON.parse(e.data); document.getElementById('claimed').innerText = d.claimed; document.getElementById('failed').innerText = d.failed; document.getElementById('total').innerText = d.total.toFixed(2); };
+}
+window.onload = connectWS;
+</script>
 </head><body><div class="box">${body}</div></body></html>`;
 
-// Express routes (เหมือนเดิม)
 app.get('/', (req, res) => {
     if (!CONFIG) {
-        res.send(html("ตั้งค่าบอท", `
+        res.send(htmlTemplate("ตั้งค่าบอท", `
             <h1>🚀 TrueMoney Auto Claim</h1>
-            <div class="warning">⚙️ กรุณาตั้งค่าบอทก่อนใช้งาน</div>
-            <h2>📋 ขั้นตอนการตั้งค่า</h2>
-            <div class="step"><span class="step-num">1</span><strong>สมัคร Telegram API</strong><div class="note">ไปที่ <a href="https://my.telegram.org/apps" target="_blank">https://my.telegram.org/apps</a></div><div class="note">1. Login ด้วยเบอร์ Telegram ของคุณ</div><div class="note">2. กรอกข้อมูล:</div><div class="note" style="margin-left:20px">• App title: <span class="code">TrueMoney Bot</span></div><div class="note" style="margin-left:20px">• Short name: <span class="code">tmbot</span></div><div class="note" style="margin-left:20px">• Platform: <span class="code">Desktop</span></div><div class="note">3. กด Create application</div><div class="note">4. คัดลอก <strong>api_id</strong> และ <strong>api_hash</strong></div></div>
-            <div class="step"><span class="step-num">2</span><strong>กรอกข้อมูลด้านล่าง</strong></div>
             <form action="/save-config" method="POST">
-                <label class="label">🔑 API ID</label><input type="text" name="apiId" placeholder="12345678" required><div class="note">ตัวเลขที่ได้จาก my.telegram.org</div>
-                <label class="label">🔐 API Hash</label><input type="text" name="apiHash" placeholder="abc123def456..." required><div class="note">รหัสยาวๆ ที่ได้จาก my.telegram.org</div>
-                <label class="label">📱 เบอร์ Telegram</label><input type="text" name="phoneNumber" placeholder="+66812345678" required><div class="note">ต้องขึ้นต้นด้วย +66 (ไม่ใช่ 0)</div>
-                <label class="label">💰 เบอร์กระเป๋า TrueMoney</label><input type="text" name="walletNumber" placeholder="0812345678" required><div class="note">เบอร์ที่จะรับเงิน (เริ่มต้นด้วย 0)</div>
-                <label class="label">📝 ชื่อกระเป๋า (ไม่บังคับ)</label><input type="text" name="walletName" placeholder="กระเป๋าหลัก">
-                <button type="submit">✅ บันทึกและเริ่มใช้งาน</button>
+                <input type="text" name="apiId" placeholder="API ID" required>
+                <input type="text" name="apiHash" placeholder="API Hash" required>
+                <input type="text" name="phoneNumber" placeholder="+668xxxxxxxx" required>
+                <input type="text" name="walletNumber" placeholder="เบอร์ TrueMoney หลัก" required>
+                <input type="text" name="userPhones" placeholder="เบอร์รอง,คั่นด้วยคอมมา (ไม่บังคับ)">
+                <select name="distribution">
+                    <option value="owner_only">รับเฉพาะหลัก</option>
+                    <option value="round_robin">สลับหลัก+รอง</option>
+                    <option value="users_only">รับเฉพาะรอง</option>
+                    <option value="owner_first_then_users">หลักก่อนแล้วรอง parallel</option>
+                </select>
+                <input type="text" name="fallbackApiUrl" placeholder="Fallback API URL (ไม่บังคับ)">
+                <label><input type="checkbox" name="useQR"> เปิดสแกน QR</label>
+                <label><input type="checkbox" name="expandShortUrls" checked> ขยายลิงก์ย่อ</label>
+                <button type="submit">บันทึกและเริ่ม</button>
             </form>
-            <div class="info" style="margin-top:20px">💡 <strong>หมายเหตุ:</strong> ข้อมูลจะถูกเก็บไว้ใน Environment Variables</div>
         `));
     } else if (loginStep === "logged-in") {
-        res.send(html("Dashboard", `
+        res.send(htmlTemplate("Dashboard", `
             <h1>🚀 TrueMoney Bot</h1>
-            <div class="success">✅ บอทกำลังทำงาน</div>
-            <div class="stat"><div>รับสำเร็จ<span>${totalClaimed}</span></div><div>ล้มเหลว<span>${totalFailed}</span></div><div>ยอดรวม<span>${totalAmount}฿</span></div></div>
-            <div class="info">📱 เบอร์: ${maskPhone(CONFIG.phoneNumber)}</div>
-            <div class="info">💰 กระเป๋า: ${CONFIG.walletName} (${maskPhone(CONFIG.walletNumber)})</div>
-            <button onclick="if(confirm('ต้องการตั้งค่าใหม่?')){location.href='/reset'}" style="background:#ef4444;margin-top:20px">🔄 ตั้งค่าใหม่</button>
+            <div>รับสำเร็จ: <span id="claimed">${totalClaimed}</span></div>
+            <div>ล้มเหลว: <span id="failed">${totalFailed}</span></div>
+            <div>ยอดรวม: <span id="total">${totalAmount.toFixed(2)}</span> ฿</div>
+            <button onclick="location.href='/reset'">ตั้งค่าใหม่</button>
         `));
     } else if (loginStep === "need-send-otp") {
-        res.send(html("Login", `<h1>📱 Login Telegram</h1><div class="warning">📮 กดปุ่มด้านล่างเพื่อส่ง OTP</div><div class="info">เบอร์: ${maskPhone(CONFIG.phoneNumber)}</div><form action="/send-otp" method="POST"><button type="submit">📨 ส่ง OTP</button></form>`));
+        res.send(htmlTemplate("Login", `<form action="/send-otp" method="POST"><button>ส่ง OTP</button></form>`));
     } else if (loginStep === "need-otp") {
-        res.send(html("OTP", `<h1>🔑 ใส่รหัส OTP</h1><div class="warning">📱 ตรวจสอบรหัส OTP ใน Telegram</div><form action="/verify-otp" method="POST"><input type="text" name="otp" placeholder="12345" maxlength="5" required autofocus><button type="submit">✅ ยืนยัน</button></form>`));
+        res.send(htmlTemplate("OTP", `<form action="/verify-otp" method="POST"><input name="otp" placeholder="12345"><button>ยืนยัน</button></form>`));
     } else if (loginStep === "need-password") {
-        res.send(html("2FA", `<h1>🔒 Two-Factor Authentication</h1><div class="warning">🔐 ถ้าไม่มี 2FA ให้กด "ข้าม"</div><form action="/verify-2fa" method="POST"><input type="password" name="password" placeholder="รหัส 2FA" autofocus><button type="submit">✅ ยืนยัน</button></form><form action="/skip-2fa" method="POST"><button type="submit" style="background:#6b7280">⏭️ ข้าม</button></form>`));
+        res.send(htmlTemplate("2FA", `<form action="/verify-2fa" method="POST"><input type="password" name="password" placeholder="รหัส 2FA"><button>ยืนยัน</button></form><form action="/skip-2fa" method="POST"><button>ข้าม</button></form>`));
     } else {
-        res.send(html("Loading", `<h1>🚀 กำลังเริ่มต้น...</h1><div class="info">⏳ กรุณารอสักครู่...</div><script>setTimeout(()=>location.reload(),3000)</script>`));
+        res.send(htmlTemplate("Loading", "<div>กำลังเริ่มต้น...</div>"));
     }
 });
 
-app.post('/save-config', async (req, res) => {
+app.post('/save-config', (req, res) => {
     CONFIG = {
         apiId: parseInt(req.body.apiId),
         apiHash: req.body.apiHash,
         phoneNumber: req.body.phoneNumber,
         walletNumber: req.body.walletNumber,
-        walletName: req.body.walletName || "กระเป๋าหลัก"
+        userPhones: req.body.userPhones || "",
+        distribution: req.body.distribution,
+        fallbackApiUrl: req.body.fallbackApiUrl || null,
+        useQR: req.body.useQR === "on",
+        expandShortUrls: req.body.expandShortUrls === "on",
     };
-    const envContent = `API_ID=${CONFIG.apiId}\nAPI_HASH=${CONFIG.apiHash}\nPHONE_NUMBER=${CONFIG.phoneNumber}\nWALLET_NUMBER=${CONFIG.walletNumber}\nWALLET_NAME=${CONFIG.walletName}`;
+    const envContent = `API_ID=${CONFIG.apiId}\nAPI_HASH=${CONFIG.apiHash}\nPHONE_NUMBER=${CONFIG.phoneNumber}\nWALLET_NUMBER=${CONFIG.walletNumber}\nUSER_PHONES=${CONFIG.userPhones}\nDISTRIBUTION=${CONFIG.distribution}\nFALLBACK_API_URL=${CONFIG.fallbackApiUrl||''}\nUSE_QR=${CONFIG.useQR}\nEXPAND_SHORT_URLS=${CONFIG.expandShortUrls}`;
     fs.writeFileSync('.env', envContent);
-    res.send(html("บันทึกสำเร็จ", `<h1>✅ บันทึกการตั้งค่าสำเร็จ</h1><div class="success">กำลังเริ่มต้นบอท...</div><div class="info">📱 เบอร์: ${maskPhone(CONFIG.phoneNumber)}<br>💰 กระเป๋า: ${CONFIG.walletName} (${maskPhone(CONFIG.walletNumber)})</div><script>setTimeout(()=>location.href='/',2000)</script>`));
+    res.send(htmlTemplate("บันทึกสำเร็จ", "<div>กำลังเริ่มบอท...</div><script>setTimeout(()=>location.href='/',2000)</script>"));
     setTimeout(() => startBot(), 3000);
 });
 
-app.get('/reset', (req, res) => {
-    CONFIG = null;
-    if (fs.existsSync('.env')) fs.unlinkSync('.env');
-    if (fs.existsSync('session.txt')) fs.unlinkSync('session.txt');
-    res.redirect('/');
-});
+app.get('/reset', (req, res) => { CONFIG = null; if(fs.existsSync('.env')) fs.unlinkSync('.env'); if(fs.existsSync('session.txt')) fs.unlinkSync('session.txt'); res.redirect('/'); });
+app.post('/send-otp', (req, res) => { loginStep = "need-otp"; res.redirect('/'); });
+app.post('/verify-otp', (req, res) => { otpCode = req.body.otp; res.redirect('/'); });
+app.post('/verify-2fa', (req, res) => { passwordCode = req.body.password; res.redirect('/'); });
+app.post('/skip-2fa', (req, res) => { passwordCode = ""; res.redirect('/'); });
 
-app.post('/send-otp', (req, res) => {
-    loginStep = "need-otp";
-    res.send(html("Sending", `<h1>📤 กำลังส่ง OTP</h1><div class="info">⏳ กรุณารอสักครู่...</div><script>setTimeout(()=>location.href='/',2000)</script>`));
-});
-app.post('/verify-otp', (req, res) => {
-    otpCode = req.body.otp;
-    res.send(html("Processing", `<h1>✅ กำลังตรวจสอบ OTP</h1><div class="info">⏳ กรุณารอสักครู่...</div><script>setTimeout(()=>location.href='/',3000)</script>`));
-});
-app.post('/verify-2fa', (req, res) => {
-    passwordCode = req.body.password;
-    res.send(html("Processing", `<h1>✅ กำลังตรวจสอบ 2FA</h1><div class="info">⏳ กรุณารอสักครู่...</div><script>setTimeout(()=>location.href='/',3000)</script>`));
-});
-app.post('/skip-2fa', (req, res) => {
-    passwordCode = "";
-    res.send(html("Processing", `<h1>✅ กำลังเข้าสู่ระบบ</h1><div class="info">⏳ กรุณารอสักครู่...</div><script>setTimeout(()=>location.href='/',3000)</script>`));
-});
+app.listen(10000, () => console.log("🌐 เว็บ: http://localhost:10000"));
+setInterval(() => { axios.get(process.env.RENDER_EXTERNAL_URL || 'http://localhost:10000').catch(()=>{}); }, 30*60*1000);
 
-app.listen(10000, () => console.log(`🌐 เว็บเซิร์ฟเวอร์รันที่ http://localhost:10000`));
-setInterval(() => {
-    const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:10000`;
-    axios.get(url).catch(() => {});
-}, 30 * 60 * 1000);
-
-// ========== ฟังก์ชันหลัก ==========
+// ========== ฟังก์ชันหลัก Telegram ==========
 async function startBot() {
     if (!CONFIG) return;
     let sessionString = await loadSession();
     const session = new StringSession(sessionString || '');
     client = new TelegramClient(session, CONFIG.apiId, CONFIG.apiHash, {
-        connectionRetries: 10,
-        useWSS: true,
-        autoReconnect: true,
-        retryDelay: 5000
+        connectionRetries: 10, useWSS: true, autoReconnect: true, retryDelay: 5000
     });
-    console.log("🚀 กำลังเริ่มบอท...\n");
+    console.log("🚀 กำลังเริ่มบอท...");
     try {
         if (sessionString) {
-            console.log("🔐 กำลังเชื่อมต่อด้วย session ที่บันทึกไว้...");
             await client.start({ botAuthToken: false, onError: e => console.error(e.message) });
             loginStep = "logged-in";
-            console.log("✅ เชื่อมต่อสำเร็จ!\n");
+            console.log("✅ เชื่อมต่อสำเร็จ");
         } else {
-            console.log("🔐 ยังไม่มี session กรุณา login ผ่านเว็บ...\n");
             loginStep = "need-send-otp";
             await client.start({
-                phoneNumber: async () => {
-                    while (loginStep === "need-send-otp") await new Promise(r => setTimeout(r, 100));
-                    return CONFIG.phoneNumber;
-                },
-                password: async () => {
-                    loginStep = "need-password";
-                    while (loginStep === "need-password" && passwordCode === "") await new Promise(r => setTimeout(r, 100));
-                    return passwordCode || undefined;
-                },
-                phoneCode: async () => {
-                    while (!otpCode) await new Promise(r => setTimeout(r, 100));
-                    const code = otpCode;
-                    otpCode = "";
-                    return code;
-                },
+                phoneNumber: async () => { while (loginStep === "need-send-otp") await new Promise(r => setTimeout(r, 100)); return CONFIG.phoneNumber; },
+                password: async () => { loginStep = "need-password"; while (loginStep === "need-password" && passwordCode === "") await new Promise(r => setTimeout(r, 100)); return passwordCode || undefined; },
+                phoneCode: async () => { while (!otpCode) await new Promise(r => setTimeout(r, 100)); const code = otpCode; otpCode = ""; return code; },
                 onError: e => console.error(e.message),
             });
             const newSession = client.session.save();
             await saveSession(newSession);
             loginStep = "logged-in";
-            console.log("\n✅ เข้าสู่ระบบสำเร็จ!\n");
+            console.log("✅ เข้าสู่ระบบสำเร็จ");
         }
-    } catch (err) {
-        console.error("❌ Login ล้มเหลว:", err.message);
-        return;
-    }
-    console.log("👂 กำลังฟังข้อความใน Telegram...\n");
+    } catch (err) { console.error("❌ Login ล้มเหลว:", err.message); return; }
+    
+    console.log("👂 กำลังฟังข้อความ...");
     client.addEventHandler(async (event) => {
         try {
             const msg = event.message;
             if (!msg) return;
-            let source = "Unknown";
-            if (msg.chat) {
-                source = msg.chat.title || msg.chat.username || msg.chat.id?.toString() || "Unknown";
+            let source = msg.chat?.title || msg.chat?.username || "Unknown";
+            // ดึง voucher จากข้อความ
+            let vouchers = [];
+            if (msg.message) {
+                const matches = msg.message.match(/v=([a-zA-Z0-9]+)/g);
+                if (matches) vouchers.push(...matches.map(m => m.slice(2)));
             }
-            if (msg.media?.className === "MessageMediaPhoto") {
+            // ถ้ามีรูปและเปิด QR scan
+            if (msg.media?.className === "MessageMediaPhoto" && CONFIG.useQR) {
                 try {
-                    const downloadPromise = client.downloadMedia(msg.media, { workers: 1 });
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Download timeout')), 8000));
-                    const buffer = await Promise.race([downloadPromise, timeoutPromise]);
+                    const buffer = await client.downloadMedia(msg.media, { workers: 1 });
                     if (buffer && buffer.length > 2000) {
-                        const qrData = await decodeQR(buffer);
-                        if (qrData) {
-                            const vouchers = extractVoucher(qrData);
-                            if (vouchers) {
-                                const startTime = Date.now();
-                                await Promise.all(vouchers.map(v => limit(() => processVoucher(v, source, startTime))));
-                            }
+                        const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
+                        const qr = jsQR(new Uint8ClampedArray(data), info.width, info.height);
+                        if (qr && qr.data) {
+                            const qrMatches = qr.data.match(/v=([a-zA-Z0-9]+)/);
+                            if (qrMatches) vouchers.push(qrMatches[1]);
                         }
                     }
-                } catch (err) {
-                    console.error("⚠️ ดาวน์โหลดรูปไม่สำเร็จ (ข้าม):", err.message);
+                } catch (err) { console.error("QR decode error:", err.message); }
+            }
+            // ขยายลิงก์ย่อถ้าเปิดใช้งาน
+            if (CONFIG.expandShortUrls && msg.message) {
+                const shortUrlPattern = /https?:\/\/(bit\.ly|tinyurl\.com|goo\.gl|tmn\.app)\/[\w\-]+/i;
+                const shortMatch = msg.message.match(shortUrlPattern);
+                if (shortMatch) {
+                    const expanded = await expandShortUrl(shortMatch[0]);
+                    const expandedVoucher = expanded.match(/v=([a-zA-Z0-9]+)/);
+                    if (expandedVoucher) vouchers.push(expandedVoucher[1]);
                 }
             }
-            if (msg.message) {
-                const vouchers = extractVoucher(msg.message);
-                if (vouchers) {
-                    const startTime = Date.now();
-                    await Promise.all(vouchers.map(v => limit(() => processVoucher(v, source, startTime))));
-                }
+            // รีดีม voucher ที่พบ
+            for (const v of [...new Set(vouchers)]) {
+                const start = Date.now();
+                await limit(() => processVoucher(v, source, start));
             }
-        } catch (err) {
-            console.error("❌ ข้อผิดพลาดในการประมวลผลข้อความ:", err.message);
-        }
+        } catch (err) { console.error("Handler error:", err.message); }
     }, new NewMessage({ incoming: true }));
-    console.log("✅ บอทพร้อมทำงานแล้ว!\n");
+    console.log("✅ บอทพร้อมทำงาน");
 }
 
-// เริ่มต้นบอทถ้ามี .env
+// เริ่มต้น
 if (fs.existsSync('.env')) {
     require('dotenv').config();
     if (process.env.API_ID && process.env.API_HASH) {
@@ -481,7 +403,11 @@ if (fs.existsSync('.env')) {
             apiHash: process.env.API_HASH,
             phoneNumber: process.env.PHONE_NUMBER,
             walletNumber: process.env.WALLET_NUMBER,
-            walletName: process.env.WALLET_NAME || "กระเป๋าหลัก"
+            userPhones: process.env.USER_PHONES || "",
+            distribution: process.env.DISTRIBUTION || "owner_only",
+            fallbackApiUrl: process.env.FALLBACK_API_URL || null,
+            useQR: process.env.USE_QR === "true",
+            expandShortUrls: process.env.EXPAND_SHORT_URLS !== "false",
         };
         startBot();
     }
