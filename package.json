@@ -1,27 +1,36 @@
 {
   "name": "truemoney-auto-claim",
-  "version": "1.0.0",
-  "description": "Auto claim TrueMoney with tw-voucher (Supabase for persistent session)",
+  "version": "2.1.0",
+  "description": "TrueMoney Auto Claim Bot with cloudscraper, multi-wallet, fallback, real-time dashboard, and Supabase session",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "keywords": ["telegram", "truemoney", "autoclaim", "supabase"],
+  "keywords": [
+    "telegram",
+    "truemoney",
+    "autoclaim",
+    "cloudscraper",
+    "supabase",
+    "discord-webhook",
+    "multi-wallet"
+  ],
   "author": "tawan_x2noban",
   "license": "MIT",
   "dependencies": {
-    "@fortune-inc/tw-voucher": "^1.0.0",
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.6.2",
     "body-parser": "^1.20.2",
+    "cloudscraper": "^4.6.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-basic-auth": "^1.2.1",
     "jsqr": "^1.4.0",
     "p-limit": "^4.0.0",
     "sharp": "^0.33.4",
-    "telegram": "^2.22.2"
+    "telegram": "^2.22.2",
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
