@@ -1,6 +1,6 @@
 {
   "name": "truemoney-auto-claim",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "TrueMoney Auto Claim Bot with cloudscraper, multi-wallet, fallback, real-time dashboard, and Supabase session",
   "main": "index.js",
   "type": "commonjs",
