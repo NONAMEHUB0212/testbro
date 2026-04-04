@@ -42,14 +42,14 @@ if (supabaseUrl && supabaseKey) {
 // ========== p-limit ==========
 let pLimit;
 try { const pl = require('p-limit'); pLimit = typeof pl === 'function' ? pl : pl.default; } catch (e) { pLimit = () => (fn) => fn(); }
-const limit = pLimit(1);  // จำกัด concurrency การรีดีม
+const limit = pLimit(1);          // main redeem queue
+const userLimit = pLimit(3);      // concurrency สำหรับ user tasks ในโหมด owner_first_then_users
 
 // ========== Express + WebSocket ==========
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// Basic Auth (optional)
 if (process.env.ADMIN_PASSWORD) {
     const basicAuth = require('express-basic-auth');
     app.use(basicAuth({ users: { 'admin': process.env.ADMIN_PASSWORD }, challenge: true, unauthorizedResponse: 'Unauthorized' }));
@@ -60,7 +60,7 @@ let CONFIG = null;
 let totalClaimed = 0, totalFailed = 0, totalAmount = 0;
 let loginStep = "need-config", otpCode = "", passwordCode = "", client = null;
 
-// Cache voucher
+// Cache voucher ที่เคยเห็น (กันซ้ำ) - เปลี่ยนอายุเป็น 1 ชั่วโมง
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -69,8 +69,12 @@ function isDuplicate(voucher) {
 }
 setInterval(() => {
     const now = Date.now();
-    for (let [k, t] of recentSeen) if (now - t > 30000) recentSeen.delete(k);
+    for (let [k, t] of recentSeen) if (now - t > 3600000) recentSeen.delete(k);
 }, 60000);
+
+// Cache voucher ที่หมดอายุแล้ว (ลดการแจ้งเตือนซ้ำ)
+const expiredCache = new Set();
+setInterval(() => expiredCache.clear(), 3600000);
 
 // ระบบแจกจ่ายเบอร์
 let userClaimIndex = 0;
@@ -113,8 +117,8 @@ async function loadSession() {
     return null;
 }
 
-// ========== ฟังก์ชันรีดีมด้วย cloudscraper ==========
-async function claimWithCloudscraper(voucher, phone, retryCount = 0) {
+// ========== ฟังก์ชันรีดีมด้วย cloudscraper (ไม่ throw error) ==========
+async function claimWithCloudscraper(voucher, phone) {
     const url = `https://gift.truemoney.com/campaign/vouchers/${voucher}/redeem`;
     const payload = { mobile: phone.replace(/-/g, ''), voucher_hash: voucher };
     const headers = {
@@ -126,48 +130,76 @@ async function claimWithCloudscraper(voucher, phone, retryCount = 0) {
         'Connection': 'keep-alive'
     };
     
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         cloudscraper.post(url, {
             json: payload,
             headers: headers,
-            timeout: 10000
+            timeout: 10000,
+            simple: false,
+            resolveWithFullResponse: true
         }, (error, response, body) => {
-            if (error) return reject(error);
-            resolve(body);
+            if (error) {
+                resolve({ status: { code: 'NETWORK_ERROR', message: error.message }, data: null });
+                return;
+            }
+            let parsedBody = body;
+            if (typeof body === 'string') {
+                try { parsedBody = JSON.parse(body); } catch(e) { parsedBody = {}; }
+            }
+            resolve(parsedBody);
         });
     });
 }
 
+// ฟังก์ชันอัปเดต Dashboard (WebSocket)
+function updateDashboardStats() {
+    const stats = { claimed: totalClaimed, failed: totalFailed, total: totalAmount, queue: 0, status: "ทำงาน" };
+    wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(stats)); });
+}
+
 async function claimForPhone(voucher, phone, startTime, role) {
-    const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
-    try {
-        const result = await claimWithCloudscraper(voucher, phone);
-        const ms = Date.now() - startTime;
-        if (result.status?.code === 'SUCCESS') {
-            const amount = parseFloat(result.data.my_ticket.amount_baht);
-            totalClaimed++;
-            totalAmount += amount;
-            console.log(`✅ ${role}: +${amount}฿ (${ms}ms) เบอร์ ${phone.slice(-4)}`);
-            sendDiscordEmbed("🎯 TAWAN SNIPER", 
-                `✅ **รีดีมสำเร็จ**\n💰 ${amount} ฿\n⚡ ${ms}ms\n👤 ${role}\n🎫 \`${voucher}\``, 5763719);
-            return true;
-        } else if (result.status?.code === 'VOUCHER_OUT_OF_STOCK') {
-            console.log(`❌ ${role}: ซองหมดแล้ว (${ms}ms)`);
-            if (role === "Owner") sendDiscordEmbed("🎪 ซองหมดแล้ว", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
-            return true;
-        } else if (result.status?.code === 'VOUCHER_EXPIRED') {
-            console.log(`❌ ${role}: ซองหมดอายุ (${ms}ms)`);
-            if (role === "Owner") sendDiscordEmbed("🎪 ซองหมดอายุ", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
-            return true;
-        } else if (result.status?.code === 'VOUCHER_NOT_FOUND') {
-            console.log(`❌ ${role}: ไม่พบซอง (${ms}ms)`);
-            if (role === "Owner") sendDiscordEmbed("🎪 ไม่พบซอง", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
-            return true;
+    const result = await claimWithCloudscraper(voucher, phone);
+    const ms = Date.now() - startTime;
+    const statusCode = result.status?.code;
+    
+    if (statusCode === 'SUCCESS') {
+        const amount = parseFloat(result.data?.my_ticket?.amount_baht || 0);
+        totalClaimed++;
+        totalAmount += amount;
+        updateDashboardStats();
+        console.log(`✅ ${role}: +${amount}฿ (${ms}ms) เบอร์ ${phone.slice(-4)}`);
+        sendDiscordEmbed("🎯 TAWAN SNIPER", 
+            `✅ **รีดีมสำเร็จ**\n💰 ${amount} ฿\n⚡ ${ms}ms\n👤 ${role}\n🎫 \`${voucher}\``, 5763719);
+        return true;
+    } 
+    else if (statusCode === 'VOUCHER_OUT_OF_STOCK') {
+        console.log(`❌ ${role}: ซองหมดแล้ว (${ms}ms)`);
+        if (role === "Owner") sendDiscordEmbed("🎪 ซองหมดแล้ว", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
+        totalFailed++;
+        updateDashboardStats();
+        return true;
+    }
+    else if (statusCode === 'VOUCHER_EXPIRED') {
+        expiredCache.add(voucher);
+        console.log(`❌ ${role}: ซองหมดอายุ (${ms}ms)`);
+        if (role === "Owner" && !expiredCache.has(voucher)) {
+            sendDiscordEmbed("🎪 ซองหมดอายุ", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
         }
-        console.log(`❌ ${role}: direct ล้มเหลว (${ms}ms) - ${result.status?.message || ''}`);
-        return false;
-    } catch (err) {
-        console.log(`❌ ${role}: error - ${err.message}`);
+        totalFailed++;
+        updateDashboardStats();
+        return true;
+    }
+    else if (statusCode === 'VOUCHER_NOT_FOUND') {
+        console.log(`❌ ${role}: ไม่พบซอง (${ms}ms)`);
+        if (role === "Owner") sendDiscordEmbed("🎪 ไม่พบซอง", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
+        totalFailed++;
+        updateDashboardStats();
+        return true;
+    }
+    else {
+        console.log(`❌ ${role}: ล้มเหลว (${ms}ms) - ${result.status?.message || 'unknown'}`);
+        totalFailed++;
+        updateDashboardStats();
         return false;
     }
 }
@@ -177,40 +209,48 @@ async function processVoucher(voucher, source, startTime) {
     const fullUrl = `https://gift.truemoney.com/campaign/?v=${voucher}`;
     const distribution = CONFIG.distribution || "owner_only";
     const ownerPhone = CONFIG.walletNumber;
-    const userPhones = CONFIG.userPhones ? CONFIG.userPhones.split(',').map(p => p.trim()) : [];
+    const userPhonesRaw = CONFIG.userPhones || "";
+    const userPhones = userPhonesRaw.split(',').map(p => p.trim()).filter(p => p);
     
-    // แจ้งเตือนพบ voucher
-    sendDiscordSimple(`🎫 เจอ VOUCHER ใหม่\n🔑 ${fullUrl}\n📱 แหล่งที่มา ${source}\n📦 เข้าการเป๋า ${distribution}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`);
+    // แจ้งเตือนพบ voucher เฉพาะถ้ายังไม่เคยหมดอายุ
+    if (!expiredCache.has(voucher)) {
+        sendDiscordSimple(`🎫 เจอ VOUCHER ใหม่\n🔑 ${fullUrl}\n📱 แหล่งที่มา ${source}\n📦 เข้าการเป๋า ${distribution}\n━━━━━━━━━━━━━━━━━━\n⚡ กำลังคว้า...\nby tawan_x2noban`);
+    }
     
     if (distribution === "owner_first_then_users") {
         // Owner ก่อน
         const ownerSuccess = await claimForPhone(voucher, ownerPhone, startTime, "Owner");
-        // รอ 10ms แล้วให้ users ทุกคน parallel
+        // รอ 10ms แล้วให้ users ทุกคน parallel (จำกัด concurrency)
         await new Promise(r => setTimeout(r, 10));
-        const userTasks = userPhones.map(phone => claimForPhone(voucher, phone, startTime, "User"));
+        const userTasks = userPhones.map(phone => userLimit(() => claimForPhone(voucher, phone, startTime, "User")));
         await Promise.all(userTasks);
     } else {
         const targetPhone = getClaimPhone(distribution, ownerPhone, userPhones);
         const success = await claimForPhone(voucher, targetPhone, startTime, "Main");
         if (!success && CONFIG.fallbackApiUrl) {
-            // Fallback API
             try {
                 const payload = { phone: targetPhone, voucher: voucher };
-                const fbRes = await axios.post(CONFIG.fallbackApiUrl, payload, { timeout: 8000 });
+                const fbRes = await axios.post(CONFIG.fallbackApiUrl, payload, { timeout: 5000 });
                 if (fbRes.data?.status === true && fbRes.data?.amount) {
                     const amt = parseFloat(fbRes.data.amount);
                     totalClaimed++; totalAmount += amt;
+                    updateDashboardStats();
                     console.log(`✅ Fallback: +${amt}฿ เบอร์ ${targetPhone.slice(-4)}`);
                     sendDiscordEmbed("🎯 TAWAN SNIPER", `✅ **Fallback สำเร็จ**\n💰 ${amt} ฿\n🎫 \`${voucher}\``, 5763719);
                 } else {
                     totalFailed++;
+                    updateDashboardStats();
                     sendDiscordEmbed("⚠️ คว้าล้มเหลว", `🎫 \`${voucher}\`\n❌ Direct + Fallback ล้มเหลว`, 15158332);
                 }
-            } catch (err) { totalFailed++; }
-        } else if (!success) totalFailed++;
+            } catch (err) {
+                totalFailed++;
+                updateDashboardStats();
+            }
+        } else if (!success) {
+            totalFailed++;
+            updateDashboardStats();
+        }
     }
-    // อัปเดตสถิติ (Dashboard)
-    updateDashboardStats();
 }
 
 // ========== ขยายลิงก์ย่อ ==========
@@ -224,10 +264,7 @@ async function expandShortUrl(shortUrl) {
 // ========== WebSocket Dashboard ==========
 const wss = new WebSocket.Server({ port: 10001 });
 let dashboardStats = { claimed: 0, failed: 0, total: 0, queue: 0, status: "พร้อม" };
-function updateDashboardStats() {
-    dashboardStats = { claimed: totalClaimed, failed: totalFailed, total: totalAmount, queue: 0, status: "ทำงาน" };
-    wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(dashboardStats)); });
-}
+// ประกาศ function updateDashboardStats แล้ว (อยู่ด้านบน)
 
 // ========== Express Routes (หน้าเว็บ) ==========
 const htmlTemplate = (title, body) => `<!DOCTYPE html>
@@ -246,6 +283,7 @@ let ws;
 function connectWS() {
     ws = new WebSocket('ws://' + location.hostname + ':10001');
     ws.onmessage = (e) => { const d = JSON.parse(e.data); document.getElementById('claimed').innerText = d.claimed; document.getElementById('failed').innerText = d.failed; document.getElementById('total').innerText = d.total.toFixed(2); };
+    ws.onerror = () => setTimeout(connectWS, 5000);
 }
 window.onload = connectWS;
 </script>
@@ -354,13 +392,12 @@ async function startBot() {
             const msg = event.message;
             if (!msg) return;
             let source = msg.chat?.title || msg.chat?.username || "Unknown";
-            // ดึง voucher จากข้อความ
             let vouchers = [];
             if (msg.message) {
                 const matches = msg.message.match(/v=([a-zA-Z0-9]+)/g);
                 if (matches) vouchers.push(...matches.map(m => m.slice(2)));
             }
-            // ถ้ามีรูปและเปิด QR scan
+            // QR Scan
             if (msg.media?.className === "MessageMediaPhoto" && CONFIG.useQR) {
                 try {
                     const buffer = await client.downloadMedia(msg.media, { workers: 1 });
@@ -374,7 +411,7 @@ async function startBot() {
                     }
                 } catch (err) { console.error("QR decode error:", err.message); }
             }
-            // ขยายลิงก์ย่อถ้าเปิดใช้งาน
+            // ขยายลิงก์ย่อ
             if (CONFIG.expandShortUrls && msg.message) {
                 const shortUrlPattern = /https?:\/\/(bit\.ly|tinyurl\.com|goo\.gl|tmn\.app)\/[\w\-]+/i;
                 const shortMatch = msg.message.match(shortUrlPattern);
@@ -384,7 +421,7 @@ async function startBot() {
                     if (expandedVoucher) vouchers.push(expandedVoucher[1]);
                 }
             }
-            // รีดีม voucher ที่พบ
+            // รีดีม
             for (const v of [...new Set(vouchers)]) {
                 const start = Date.now();
                 await limit(() => processVoucher(v, source, start));
