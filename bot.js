@@ -13,7 +13,15 @@ const cloudscraper = require("cloudscraper");
 require("dotenv").config();
 
 // ========== แก้ไขปัญหา p-limit (ใช้เวอร์ชัน 4.x) ==========
-const pLimit = require('p-limit');  // version 4.0.0 รองรับ CommonJS
+// รองรับ p-limit ทั้ง CommonJS และ ESM
+let pLimit;
+try {
+    const pl = require('p-limit');
+    pLimit = typeof pl === 'function' ? pl : pl.default;
+} catch (e) {
+    // Fallback ถ้าไม่มี p-limit
+    pLimit = (concurrency) => (fn) => fn();
+}
 const limit = pLimit(1);
 const userLimit = pLimit(3);
 
