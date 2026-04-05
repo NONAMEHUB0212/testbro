@@ -12,6 +12,11 @@ const WebSocket = require("ws");
 const cloudscraper = require("cloudscraper");
 require("dotenv").config();
 
+// ========== แก้ไขปัญหา p-limit (ใช้เวอร์ชัน 4.x) ==========
+const pLimit = require('p-limit');  // version 4.0.0 รองรับ CommonJS
+const limit = pLimit(1);
+const userLimit = pLimit(3);
+
 // ========== Discord ==========
 const webhookUrls = process.env.WEBHOOK_URL ? process.env.WEBHOOK_URL.split(',').map(u => u.trim()) : [];
 
@@ -46,7 +51,6 @@ let roundRobinIndex = 0;
 
 let CONFIG = null;
 let loginStep = "need-config", otpCode = "", passwordCode = "", client = null;
-let reconnectInterval = null;
 
 // Cache
 const recentSeen = new Map();
@@ -89,11 +93,6 @@ setInterval(() => {
         yesterdayAvgLatency = avg;
     }
 }, 60000);
-
-// p-limit
-const pLimit = require('p-limit');
-const limit = pLimit(1);
-const userLimit = pLimit(3);
 
 // ========== Express + WebSocket (single port) ==========
 const app = express();
@@ -451,14 +450,12 @@ async function processVoucher(voucher, source, startTime, messageSentTime) {
         targetPhone = userPhones[roundRobinIndex % userPhones.length];
         roundRobinIndex++;
     } else if (distribution === "owner_first_then_users") {
-        // owner first, then users parallel
         await claimForPhone(voucher, ownerPhone, startTime, "Owner");
         await new Promise(r => setTimeout(r, 10));
         const tasks = userPhones.map(phone => userLimit(() => claimForPhone(voucher, phone, startTime, "User")));
         await Promise.all(tasks);
         return;
     }
-    // fallback if fallbackApiUrl exists
     let success = await claimForPhone(voucher, targetPhone, startTime, "Main");
     if (!success && CONFIG.fallbackApiUrl) {
         try {
