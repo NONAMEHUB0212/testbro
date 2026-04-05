@@ -1,23 +1,9 @@
 {
   "name": "truemoney-auto-claim",
-  "version": "2.2.0",
-  "description": "TrueMoney Auto Claim Bot with cloudscraper, multi-wallet, fallback, real-time dashboard, and Supabase session",
+  "version": "2.4.0",
+  "description": "TrueMoney Auto Claim with Racing Mode, Heart, Chart.js, Supabase",
   "main": "index.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "keywords": [
-    "telegram",
-    "truemoney",
-    "autoclaim",
-    "cloudscraper",
-    "supabase",
-    "discord-webhook",
-    "multi-wallet"
-  ],
-  "author": "tawan_x2noban",
-  "license": "MIT",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.6.2",
@@ -31,8 +17,5 @@
     "sharp": "^0.33.4",
     "telegram": "^2.22.2",
     "ws": "^8.16.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
