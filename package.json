@@ -1,9 +1,11 @@
 {
   "name": "truemoney-auto-claim",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "TrueMoney Auto Claim with Racing Mode, Heart, Chart.js, Supabase",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.6.2",
