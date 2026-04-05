@@ -60,7 +60,7 @@ let CONFIG = null;
 let totalClaimed = 0, totalFailed = 0, totalAmount = 0;
 let loginStep = "need-config", otpCode = "", passwordCode = "", client = null;
 
-// Cache voucher ที่เคยเห็น (กันซ้ำ) - เปลี่ยนอายุเป็น 1 ชั่วโมง
+// Cache voucher ที่เคยเห็น (กันซ้ำ) - อายุ 1 ชั่วโมง
 const recentSeen = new Map();
 function isDuplicate(voucher) {
     if (recentSeen.has(voucher)) return true;
@@ -72,7 +72,7 @@ setInterval(() => {
     for (let [k, t] of recentSeen) if (now - t > 3600000) recentSeen.delete(k);
 }, 60000);
 
-// Cache voucher ที่หมดอายุแล้ว (ลดการแจ้งเตือนซ้ำ)
+// Cache voucher ที่หมดอายุแล้ว (ลดการแจ้งเตือน "เจอ VOUCHER ใหม่" ซ้ำ)
 const expiredCache = new Set();
 setInterval(() => expiredCache.clear(), 3600000);
 
@@ -180,11 +180,11 @@ async function claimForPhone(voucher, phone, startTime, role) {
         return true;
     }
     else if (statusCode === 'VOUCHER_EXPIRED') {
-        expiredCache.add(voucher);
         console.log(`❌ ${role}: ซองหมดอายุ (${ms}ms)`);
-        if (role === "Owner" && !expiredCache.has(voucher)) {
+        if (role === "Owner") {
             sendDiscordEmbed("🎪 ซองหมดอายุ", `🎫 \`${voucher}\`\n⚡ ${ms}ms`, 10197915);
         }
+        expiredCache.add(voucher);   // กันการแจ้ง "เจอ VOUCHER ใหม่" ซ้ำ
         totalFailed++;
         updateDashboardStats();
         return true;
